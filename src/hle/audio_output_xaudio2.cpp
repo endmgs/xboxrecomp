@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <objbase.h>
 #include <xaudio2.h>
+#include <xaudio2fx.h>
+#include <xapofx.h>
 
 #include <atomic>
 #include <cmath>
@@ -45,7 +47,20 @@ struct OutputVoice {
        submission arrived: each one is a gap in the sound. */
     uint32_t starved;
     bool fed;
+    uint32_t mix_applied;           /* SlotMix::generation last applied */
 };
+
+/* recomp_audio_output_set_mix: kept per slot, not per voice, so a voice the
+   slot gets later (a format change, a reset) starts with it too. */
+struct SlotMix {
+    bool set;
+    float levels[2][RECOMP_SPEAKERS];
+    float ratio;
+    uint32_t generation;            /* bumped on every change; 0 = never set */
+};
+
+/* Voices may play up to this much faster than they are submitted. */
+constexpr float kMaxFrequencyRatio = 8.0f;
 
 std::atomic<HRESULT> critical_error{S_OK};
 
@@ -62,7 +77,23 @@ EngineCallback callback;
 IXAudio2 *engine;
 IXAudio2MasteringVoice *master;
 OutputVoice voices[kVoiceCount];
+SlotMix mixes[kVoiceCount];
 bool reported_nonzero[kVoiceCount];
+/* The mastering voice's speakers: how many, and which (SPEAKER_* mask). */
+uint32_t master_channels;
+DWORD master_mask;
+/* RECOMP_AUDIO_METER=1: XAudio2's volume meter on the mastering voice. The
+   mix is float until it reaches the device, where anything past full scale is
+   clipped, so this is the one place distortion from a too-loud mix shows. */
+bool meter_on;
+/* With the meter on, every voice goes through this submix, which carries the
+   meter, on its way to the mastering voice -- so the meter reads the mix
+   before the master's volume, and a muted run (RECOMP_MUTE) can still be
+   measured. */
+IXAudio2SubmixVoice *meter_mix;
+unsigned long long meter_last_poll, meter_last_report;
+float meter_peak_max;
+unsigned long meter_readings, meter_over;
 bool attempted, com_initialized, callback_registered, summary_printed;
 unsigned long long submitted_buffers, submitted_bytes, nonzero_buffers;
 unsigned long long dropped_buffers;
@@ -120,6 +151,9 @@ void destroyVoice(OutputVoice &voice)
 void releaseOutput()
 {
     for (auto &voice : voices) destroyVoice(voice);
+    if (meter_mix) meter_mix->DestroyVoice();
+    meter_mix = nullptr;
+    meter_on = false;
     if (master) master->DestroyVoice();
     master = nullptr;
     if (engine) {
@@ -144,6 +178,114 @@ void checkCriticalError()
 {
     const HRESULT error = critical_error.load(std::memory_order_relaxed);
     if (engine && FAILED(error)) disableOutput("device", error);
+}
+
+/* The mastering voice's channel for a SPEAKER_* bit, or -1. */
+int masterChannel(DWORD speaker)
+{
+    if (!(master_mask & speaker)) return -1;
+    DWORD below = master_mask & (speaker - 1);
+    int index = 0;
+    while (below) { index += below & 1u; below >>= 1; }
+    return index < static_cast<int>(master_channels) ? index : -1;
+}
+
+/* Add `level` of a source channel to an Xbox speaker, on whatever the device
+   has: the speaker itself, else its usual fold-down (centre to both fronts
+   and the backs to the sides or the fronts at -3 dB, LFE dropped, a mono
+   device taking everything at -3 dB). */
+void foldSpeaker(float *matrix, uint32_t src_channels, uint32_t c, int speaker, float level)
+{
+    constexpr float kMinus3dB = 0.70710678f;
+    auto add = [&](int channel, float gain) {
+        if (channel >= 0)
+            matrix[static_cast<uint32_t>(channel) * src_channels + c] += level * gain;
+    };
+    const int fl = masterChannel(SPEAKER_FRONT_LEFT), fr = masterChannel(SPEAKER_FRONT_RIGHT);
+    if (fl < 0 && fr < 0) {                              /* not a speaker layout we know */
+        if (speaker != RECOMP_SPEAKER_LFE) add(0, kMinus3dB);
+        return;
+    }
+    switch (speaker) {
+    case RECOMP_SPEAKER_FRONT_LEFT:  add(fl, 1.0f); break;
+    case RECOMP_SPEAKER_FRONT_RIGHT: add(fr, 1.0f); break;
+    case RECOMP_SPEAKER_CENTER: {
+        const int ch = masterChannel(SPEAKER_FRONT_CENTER);
+        if (ch >= 0) add(ch, 1.0f);
+        else { add(fl, kMinus3dB); add(fr, kMinus3dB); }
+        break;
+    }
+    case RECOMP_SPEAKER_LFE:
+        add(masterChannel(SPEAKER_LOW_FREQUENCY), 1.0f);
+        break;
+    case RECOMP_SPEAKER_BACK_LEFT: {
+        int ch = masterChannel(SPEAKER_BACK_LEFT);
+        if (ch < 0) ch = masterChannel(SPEAKER_SIDE_LEFT);
+        if (ch >= 0) add(ch, 1.0f); else add(fl, kMinus3dB);
+        break;
+    }
+    case RECOMP_SPEAKER_BACK_RIGHT: {
+        int ch = masterChannel(SPEAKER_BACK_RIGHT);
+        if (ch < 0) ch = masterChannel(SPEAKER_SIDE_RIGHT);
+        if (ch >= 0) add(ch, 1.0f); else add(fr, kMinus3dB);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* Put the slot's mix (if it has one) on its voice. */
+void applyMix(uint32_t slot, OutputVoice &voice)
+{
+    const SlotMix &mix = mixes[slot];
+    if (!voice.source || !mix.set || voice.mix_applied == mix.generation || !master_channels)
+        return;
+    float matrix[2 * XAUDIO2_MAX_AUDIO_CHANNELS] = {};
+    for (uint32_t c = 0; c < voice.channels && c < 2; ++c)
+        for (int s = 0; s < RECOMP_SPEAKERS; ++s)
+            if (mix.levels[c][s] != 0.0f)
+                foldSpeaker(matrix, voice.channels, c, s, mix.levels[c][s]);
+    voice.source->SetOutputMatrix(meter_mix, voice.channels, master_channels, matrix);
+    float ratio = mix.ratio;
+    if (!(ratio >= 1.0f / kMaxFrequencyRatio)) ratio = 1.0f / kMaxFrequencyRatio;
+    if (ratio > kMaxFrequencyRatio) ratio = kMaxFrequencyRatio;
+    voice.source->SetFrequencyRatio(ratio);
+    voice.mix_applied = mix.generation;
+}
+
+/* RECOMP_AUDIO_METER: read the mastering voice's peak, at most every 2 ms,
+   and say every 5 s how loud the mix got and how often it was at or past
+   full scale -- clipped on its way to the device. The meter reports the last
+   processing pass only, so this samples the passes rather than seeing all. */
+void pollMeter()
+{
+    if (!meter_on || !meter_mix) return;
+    const unsigned long long now = GetTickCount64();
+    if (now - meter_last_poll < 2) return;
+    meter_last_poll = now;
+    float peaks[XAUDIO2_MAX_AUDIO_CHANNELS] = {}, rms[XAUDIO2_MAX_AUDIO_CHANNELS] = {};
+    XAUDIO2FX_VOLUMEMETER_LEVELS levels{};
+    levels.pPeakLevels = peaks;
+    levels.pRMSLevels = rms;
+    levels.ChannelCount = master_channels;
+    if (FAILED(meter_mix->GetEffectParameters(0, &levels, sizeof levels))) return;
+    float peak = 0.0f;
+    for (uint32_t i = 0; i < master_channels; ++i)
+        if (peaks[i] > peak) peak = peaks[i];
+    ++meter_readings;
+    if (peak >= 1.0f) ++meter_over;
+    if (peak > meter_peak_max) meter_peak_max = peak;
+    if (!meter_last_report) meter_last_report = now;
+    if (now - meter_last_report >= 5000) {
+        std::fprintf(stderr,
+            "[audio-output] master peak %.1f dBFS; %lu of %lu readings at or past full scale\n",
+            meter_peak_max > 0.0f ? 20.0 * std::log10(meter_peak_max) : -120.0,
+            meter_over, meter_readings);
+        std::fflush(stderr);
+        meter_peak_max = 0.0f;
+        meter_over = meter_readings = 0;
+        meter_last_report = now;
+    }
 }
 
 void dropBuffer(uint32_t slot, const char *reason)
@@ -202,6 +344,59 @@ extern "C" void recomp_audio_output_initialize(void)
         disableOutput("CreateMasteringVoice", error);
         return;
     }
+    {
+        XAUDIO2_VOICE_DETAILS details{};
+        master->GetVoiceDetails(&details);
+        master_channels = details.InputChannels;
+        if (master_channels > XAUDIO2_MAX_AUDIO_CHANNELS) master_channels = 0;
+        if (FAILED(master->GetChannelMask(&master_mask))) master_mask = 0;
+        std::fprintf(stderr, "[audio-output] device: %u channel(s), speaker mask 0x%lx\n",
+                     master_channels, static_cast<unsigned long>(master_mask));
+    }
+    /* A limiter on the mix, on by default (RECOMP_AUDIO_LIMITER=0 for none).
+     * Voices are summed in float and anything past full scale used to be
+     * clipped where the mix met the device. Measured with RECOMP_AUDIO_METER
+     * (Oct 2026): MK Shaolin Monks' fights peaked at +3.8 dBFS with every
+     * voice at one gain and +8.3 dBFS once voices reached the speakers their
+     * mix bins name, past full scale in up to 43 readings of 320 -- the
+     * distortion players heard, in Max Payne too. Below full scale it does
+     * nothing (unity loudness); above it it limits instead of clipping. */
+    {
+        const char *limit = std::getenv("RECOMP_AUDIO_LIMITER");
+        if (!(limit && std::strcmp(limit, "0") == 0) && master_channels) {
+            IUnknown *fx = nullptr;
+            FXMASTERINGLIMITER_PARAMETERS params{FXMASTERINGLIMITER_DEFAULT_RELEASE,
+                                                 FXMASTERINGLIMITER_DEFAULT_LOUDNESS};
+            if (SUCCEEDED(CreateFX(__uuidof(FXMasteringLimiter), &fx, &params, sizeof params))) {
+                XAUDIO2_EFFECT_DESCRIPTOR effect{fx, TRUE, master_channels};
+                XAUDIO2_EFFECT_CHAIN chain{1, &effect};
+                const bool on = SUCCEEDED(master->SetEffectChain(&chain));
+                fx->Release();
+                std::fprintf(stderr, "[audio-output] limiter %s\n",
+                             on ? "on the mix (RECOMP_AUDIO_LIMITER=0 for none)"
+                                : "could not be attached; the mix can clip");
+            } else {
+                std::fprintf(stderr, "[audio-output] no limiter (CreateFX failed); the mix can clip\n");
+            }
+        }
+    }
+    {
+        const char *meter = std::getenv("RECOMP_AUDIO_METER");
+        IUnknown *apo = nullptr;
+        if (meter && *meter && std::strcmp(meter, "0") != 0 && master_channels &&
+            SUCCEEDED(XAudio2CreateVolumeMeter(&apo, 0))) {
+            XAUDIO2_VOICE_DETAILS details{};
+            master->GetVoiceDetails(&details);
+            XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, master_channels};
+            XAUDIO2_EFFECT_CHAIN chain{1, &effect};
+            meter_on = SUCCEEDED(engine->CreateSubmixVoice(
+                &meter_mix, master_channels, details.InputSampleRate, 0, 0, nullptr, &chain));
+            if (!meter_on) meter_mix = nullptr;
+            apo->Release();
+            std::fprintf(stderr, "[audio-output] RECOMP_AUDIO_METER: %s\n",
+                         meter_on ? "metering the mix" : "could not attach the meter");
+        }
+    }
     /* RECOMP_MUTE: silent, but everything else as usual. RECOMP_AUDIO_GAIN=0
      * opens no device at all, and then nothing reports a play position: the
      * DirectSound streams and the movie's sound fall back to other clocks, so
@@ -239,6 +434,31 @@ extern "C" void recomp_audio_output_reset_voice(uint32_t slot)
 {
     checkCriticalError();
     if (slot < kVoiceCount) destroyVoice(voices[slot]);
+}
+
+extern "C" void recomp_audio_output_set_mix(uint32_t slot,
+                                            const float levels[2][RECOMP_SPEAKERS],
+                                            float ratio)
+{
+    if (slot >= kVoiceCount || !levels) return;
+    SlotMix &mix = mixes[slot];
+    if (mix.set && mix.ratio == ratio &&
+        std::memcmp(mix.levels, levels, sizeof mix.levels) == 0)
+        return;
+    std::memcpy(mix.levels, levels, sizeof mix.levels);
+    mix.ratio = ratio;
+    mix.set = true;
+    if (++mix.generation == 0) mix.generation = 1;
+    if (engine) applyMix(slot, voices[slot]);
+}
+
+extern "C" void recomp_audio_output_clear_mix(uint32_t slot)
+{
+    /* The slot's next voice gets the default mapping and the submitted rate.
+       The current one keeps what it has rather than being restarted, which
+       would drop what it has queued. */
+    if (slot >= kVoiceCount) return;
+    mixes[slot].set = false;
 }
 
 extern "C" int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
@@ -291,8 +511,13 @@ extern "C" int recomp_audio_output_submit(
         format.nAvgBytesPerSec = sample_rate * block_align;
         format.nBlockAlign = static_cast<WORD>(block_align);
         format.wBitsPerSample = static_cast<WORD>(bits_per_sample);
+        /* Not XAUDIO2_VOICE_NOPITCH: a slot's mix may set a frequency ratio
+           (pitch, Doppler), and changing the rate must not mean a new voice. */
+        XAUDIO2_SEND_DESCRIPTOR send{0, meter_mix};
+        XAUDIO2_VOICE_SENDS sends{1, &send};
         HRESULT error = engine->CreateSourceVoice(
-            &voice.source, &format, XAUDIO2_VOICE_NOPITCH, 1.0f);
+            &voice.source, &format, 0, kMaxFrequencyRatio, nullptr,
+            meter_mix ? &sends : nullptr);
         if (FAILED(error)) {
             dropBuffer(slot, "create-voice");
             disableOutput("CreateSourceVoice", error);
@@ -319,6 +544,8 @@ extern "C" int recomp_audio_output_submit(
         disableOutput("SetVolume", error);
         return 0;
     }
+    applyMix(slot, voice);
+    pollMeter();
     XAUDIO2_VOICE_STATE state{};
     voice.source->GetState(&state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     /* BuffersQueued includes the active buffer; only retire the FIFO prefix. */

@@ -22,6 +22,7 @@ add_library(xbox_hle STATIC
     hle_d3d8_interp.c
     d3d8_capture.c
     hle_dsound.c
+    hle_dsound_3d.c
     hle_dsound_stream.c
     dsound_buffer_model.c
     xbox_adpcm.c

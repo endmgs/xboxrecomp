@@ -43,14 +43,31 @@
 typedef struct {
     SDL_AudioStream *stream;
     uint32_t sample_rate, channels, bits_per_sample;
-    uint64_t submitted;              /* bytes put into the stream */
+    uint64_t submitted;              /* bytes put into the stream, in the caller's format */
     uint64_t chunk_end[QUEUE_SIZE];  /* FIFO: cumulative end of each submission */
     uint32_t front, queued;
+    /* The stream takes 5.1 float frames made from the caller's PCM with the
+     * slot's mix applied (recomp_audio_output_set_mix), so the bytes SDL
+     * holds are MIX_FRAME_BYTES per caller frame. */
+    int      mixed;
+    uint32_t mix_applied;
 } voice;
+
+/* recomp_audio_output_set_mix, per slot (see the XAudio2 file). */
+typedef struct {
+    int      set;
+    float    levels[2][RECOMP_SPEAKERS];
+    float    ratio;
+    uint32_t generation;
+} slot_mix;
+
+#define MIX_FRAME_BYTES (RECOMP_SPEAKERS * 4u)
+#define MAX_RATIO       8.0f
 
 static pthread_mutex_t   g_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_device;
 static voice             g_voices[VOICE_COUNT];
+static slot_mix          g_mixes[VOICE_COUNT];
 static int               g_reported_nonzero[VOICE_COUNT];
 static int               g_attempted, g_summary_printed;
 static unsigned long long g_submitted_buffers, g_submitted_bytes, g_nonzero_buffers;
@@ -75,17 +92,54 @@ static void destroy_voice(voice *v)
  * still waiting in the source format, so the rest has been pulled. */
 static uint64_t voice_played(voice *v)
 {
-    int waiting = v->stream ? SDL_GetAudioStreamQueued(v->stream) : 0;
+    int queued_bytes = v->stream ? SDL_GetAudioStreamQueued(v->stream) : 0;
+    uint32_t frame = v->channels * (v->bits_per_sample / 8);
+    uint64_t waiting;
 
-    if (waiting < 0)
-        waiting = 0;
+    if (queued_bytes < 0)
+        queued_bytes = 0;
+    /* In the caller's bytes: a mixed stream holds 5.1 float frames. */
+    waiting = v->mixed ? (uint64_t)queued_bytes / MIX_FRAME_BYTES * frame
+                       : (uint64_t)queued_bytes;
     /* SDL's resampler keeps its last few input frames (at most 7,
      * RESAMPLER_MAX_PADDING_FRAMES) until more arrive, so a voice that has
      * run dry never reaches zero and its last submission would never
      * complete. XAudio2 plays those out; count them as played. */
-    if ((uint32_t)waiting <= RESAMPLER_SLACK_FRAMES * v->channels * (v->bits_per_sample / 8))
+    if (waiting <= RESAMPLER_SLACK_FRAMES * frame)
         waiting = 0;
-    return (uint64_t)waiting >= v->submitted ? 0 : v->submitted - (uint64_t)waiting;
+    return waiting >= v->submitted ? 0 : v->submitted - waiting;
+}
+
+/* The caller's PCM as 5.1 float frames with the slot's mix applied. */
+static float *mix_pcm(const slot_mix *m, const uint8_t *pcm, uint32_t bytes,
+                      uint32_t channels, uint32_t bits, uint32_t *out_bytes)
+{
+    static float *buf;
+    static uint32_t cap;
+    uint32_t frame = channels * (bits / 8), frames = bytes / frame, f, c, s;
+    uint32_t need = frames * MIX_FRAME_BYTES;
+
+    if (need > cap) {
+        float *grown = (float *)realloc(buf, need);
+        if (!grown)
+            return NULL;
+        buf = grown;
+        cap = need;
+    }
+    for (f = 0; f < frames; f++) {
+        float *o = buf + (size_t)f * RECOMP_SPEAKERS;
+        for (s = 0; s < RECOMP_SPEAKERS; s++)
+            o[s] = 0.0f;
+        for (c = 0; c < channels && c < 2u; c++) {
+            float x = bits == 8u ? ((float)pcm[f * frame + c] - 128.0f) / 128.0f
+                                 : (float)(int16_t)(pcm[f * frame + c * 2u] |
+                                                    pcm[f * frame + c * 2u + 1u] << 8) / 32768.0f;
+            for (s = 0; s < RECOMP_SPEAKERS; s++)
+                o[s] += x * m->levels[c][s];
+        }
+    }
+    *out_bytes = need;
+    return buf;
 }
 
 static void retire_played(voice *v)
@@ -244,6 +298,34 @@ void recomp_audio_output_reset_voice(uint32_t slot)
     pthread_mutex_unlock(&g_lock);
 }
 
+void recomp_audio_output_set_mix(uint32_t slot, const float levels[2][RECOMP_SPEAKERS],
+                                 float ratio)
+{
+    slot_mix *m;
+
+    if (slot >= VOICE_COUNT || !levels)
+        return;
+    pthread_mutex_lock(&g_lock);
+    m = &g_mixes[slot];
+    if (!m->set || m->ratio != ratio || memcmp(m->levels, levels, sizeof m->levels) != 0) {
+        memcpy(m->levels, levels, sizeof m->levels);
+        m->ratio = ratio;
+        m->set = 1;
+        if (++m->generation == 0)
+            m->generation = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void recomp_audio_output_clear_mix(uint32_t slot)
+{
+    if (slot >= VOICE_COUNT)
+        return;
+    pthread_mutex_lock(&g_lock);
+    g_mixes[slot].set = 0;
+    pthread_mutex_unlock(&g_lock);
+}
+
 int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
                                  uint32_t *queued_buffers)
 {
@@ -298,7 +380,8 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
     }
     v = &g_voices[slot];
     if (v->stream && (v->sample_rate != sample_rate || v->channels != channels ||
-                      v->bits_per_sample != bits_per_sample))
+                      v->bits_per_sample != bits_per_sample ||
+                      v->mixed != g_mixes[slot].set))
         destroy_voice(v);
     if (!v->stream) {
         SDL_AudioSpec src;
@@ -306,6 +389,10 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         src.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16LE;
         src.channels = (int)channels;
         src.freq = (int)sample_rate;
+        if (g_mixes[slot].set) {
+            src.format = SDL_AUDIO_F32;
+            src.channels = RECOMP_SPEAKERS;   /* SDL's 5.1 order is the Xbox's */
+        }
         v->stream = SDL_CreateAudioStream(&src, NULL);
         if (!v->stream || !SDL_BindAudioStream(g_device, v->stream)) {
             fprintf(stderr, "[audio-output] voice %u: %s\n", slot, SDL_GetError());
@@ -317,6 +404,14 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         v->sample_rate = sample_rate;
         v->channels = channels;
         v->bits_per_sample = bits_per_sample;
+        v->mixed = g_mixes[slot].set;
+    }
+    if (v->mixed && v->mix_applied != g_mixes[slot].generation) {
+        float ratio = g_mixes[slot].ratio;
+        if (!(ratio >= 1.0f / MAX_RATIO)) ratio = 1.0f / MAX_RATIO;
+        if (ratio > MAX_RATIO) ratio = MAX_RATIO;
+        SDL_SetAudioStreamFrequencyRatio(v->stream, ratio);
+        v->mix_applied = g_mixes[slot].generation;
     }
 
     if (volume_hundredth_db < -10000)
@@ -332,7 +427,16 @@ int recomp_audio_output_submit(uint32_t slot, const uint8_t *pcm, uint32_t bytes
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    if (!SDL_PutAudioStreamData(v->stream, pcm, (int)bytes)) {
+    if (v->mixed) {
+        uint32_t out_bytes = 0;
+        const float *frames = mix_pcm(&g_mixes[slot], pcm, bytes, channels,
+                                      bits_per_sample, &out_bytes);
+        if (!frames || !SDL_PutAudioStreamData(v->stream, frames, (int)out_bytes)) {
+            drop_buffer(slot, "submit");
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+    } else if (!SDL_PutAudioStreamData(v->stream, pcm, (int)bytes)) {
         drop_buffer(slot, "submit");
         pthread_mutex_unlock(&g_lock);
         return 0;

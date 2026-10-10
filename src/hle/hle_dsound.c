@@ -50,6 +50,8 @@
 #include "dsound_buffer_model.h"
 #include "xbox_adpcm.h"
 #include "audio_output.h"
+#include "hle_dsound_3d.h"
+#include <math.h>
 
 void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
 
@@ -96,6 +98,13 @@ typedef struct Buffer {
     uint32_t gap_max_ms, discarded_ms, discards, dry;
     uint64_t report_ms;
     uint64_t cursor_trace_ms;    /* RECOMP_DSOUND_CURSOR_TRACE */
+    /* Where it is heard (hle_dsound_3d.c): the rate the title asked for
+     * (SetFrequency/SetPitch; 0 = its own), and whether the slot has a mix,
+     * in which case it is submitted at its own rate and plays at
+     * model.sample_rate through the mix's ratio. The model's rate is the
+     * asked-for one times the Doppler shift. */
+    uint32_t asked_rate;
+    int mixed;
 } Buffer;
 
 static Buffer g_buffers[SLOTS];
@@ -221,6 +230,7 @@ static void reset_output(Buffer *b)
 static void retire(Buffer *b)
 {
     recomp_audio_output_reset_voice(slot_of(b));
+    recomp_audio_output_clear_mix(slot_of(b));
     memset(b, 0, sizeof *b);
 }
 
@@ -332,10 +342,38 @@ static void pump(Buffer *b, uint64_t now)
             if (offset == out->size_bytes) offset = out->loop_start_bytes;
         }
     }
-    prime(b, out->sample_rate, channels, bits, (int32_t)setting(b->iface, SET_VOLUME));
-    recomp_audio_output_submit(slot_of(b), pcm, bytes, out->sample_rate,
-                               channels, bits,
-                               (int32_t)setting(b->iface, SET_VOLUME));
+    {
+        int32_t volume = (int32_t)setting(b->iface, SET_VOLUME);
+        float levels[2][RECOMP_SPEAKERS], doppler = 1.0f;
+        uint32_t rate = out->sample_rate;
+
+        if (hle_ds3d_mix(b->iface, channels, volume, levels, &doppler)) {
+            /* Submitted at its own rate; the mix's ratio plays it at the
+             * model's, so a rate change never restarts the host voice. */
+            rate = out->original_sample_rate;
+            recomp_audio_output_set_mix(slot_of(b), (const float (*)[RECOMP_SPEAKERS])levels,
+                                        (float)out->sample_rate / (float)rate);
+            b->mixed = 1;
+        } else if (b->mixed) {
+            recomp_audio_output_clear_mix(slot_of(b));
+            b->mixed = 0;
+        }
+        prime(b, rate, channels, bits, volume);
+        recomp_audio_output_submit(slot_of(b), pcm, bytes, rate, channels, bits, volume);
+        /* The Doppler shift changes how fast the buffer is consumed, as it
+         * does on the console -- from now: after this slice was taken, or
+         * the output clock would step over it. */
+        if (b->mixed) {
+            uint32_t asked = b->asked_rate ? b->asked_rate : b->model.original_sample_rate;
+            uint32_t want = (uint32_t)lrintf((float)asked * doppler);
+            if (want < 1000u) want = 1000u;
+            if (want > 200000u) want = 200000u;
+            if (want != b->model.sample_rate) {
+                (void)recomp_dsound_buffer_set_frequency(&b->model, want, now);
+                (void)recomp_dsound_buffer_set_frequency(&b->output_model, want, now);
+            }
+        }
+    }
 }
 
 static Buffer *find(uint32_t iface)
@@ -964,11 +1002,35 @@ HLE_EXPORT(IDirectSoundBuffer_SetCurrentPosition)
     HLE_RETURN(result);
 }
 
+static uint32_t set_rate(uint32_t iface, uint32_t frequency);
+
 /* HRESULT IDirectSoundBuffer_SetFrequency(this, DWORD frequency); 0 = default */
 HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
 {
     g_ds_calls[DS_CALL_BUF_SETFREQUENCY]++;
-    uint32_t iface = HLE_ARG(0), frequency = HLE_ARG(1), result = RECOMP_DSOUND_OK;
+    HLE_RETURN(set_rate(HLE_ARG(0), HLE_ARG(1)));
+}
+
+/* HRESULT IDirectSoundBuffer_SetPitch(this, LONG pitch): the same, in the
+ * Xbox's pitch units (1/4096 octave from 48 kHz). MK Shaolin Monks calls it
+ * from 14 places and SetFrequency from 2; until this was replaced, every one
+ * of its pitch changes went unheard. The title's own body runs first, so its
+ * settings stay as the XDK keeps them (the chip part is CMcpxVoiceClient_SetPitch,
+ * replaced below). */
+HLE_ORIGINAL(IDirectSoundBuffer_SetPitch);
+HLE_EXPORT(IDirectSoundBuffer_SetPitch)
+{
+    uint32_t iface = HLE_ARG(0);
+    int32_t pitch = (int32_t)HLE_ARG(1);
+
+    if (hle_original_IDirectSoundBuffer_SetPitch)
+        HLE_CALL_ORIGINAL(IDirectSoundBuffer_SetPitch);
+    HLE_RETURN(set_rate(iface, hle_ds3d_pitch_to_frequency(pitch)));
+}
+
+static uint32_t set_rate(uint32_t iface, uint32_t frequency)
+{
+    uint32_t result = RECOMP_DSOUND_OK;
     uint64_t now = now_ms();
     Buffer *b;
 
@@ -983,12 +1045,13 @@ HLE_EXPORT(IDirectSoundBuffer_SetFrequency)
     if (b) {
         uint32_t before = b->model.sample_rate;
         pump(b, now);
+        b->asked_rate = frequency;
         result = recomp_dsound_buffer_set_frequency(&b->model, frequency, now);
         if (result == RECOMP_DSOUND_OK && b->model.sample_rate != before)
             (void)recomp_dsound_buffer_set_frequency(&b->output_model, frequency, now);
     }
     unlock();
-    HLE_RETURN(result);
+    return result;
 }
 
 /* Whether the buffer's settings are in the layout this file reads: a rate

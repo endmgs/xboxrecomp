@@ -52,6 +52,7 @@
 #include "hle.h"
 #include "xbox_adpcm.h"
 #include "audio_output.h"
+#include "hle_dsound_3d.h"
 
 /* kernel_bridge.c: the dispatch table, for the completion callback. */
 typedef void (*recomp_func_t)(void);
@@ -121,6 +122,7 @@ typedef struct Stream {
     uint64_t skipped;                /* decoded bytes stepped over unsent; note_skip */
     const char *last_event;          /* flush, pause, resume, restart: for note_skip */
     uint64_t active_ms;              /* last packet or pause/resume from the title */
+    int      mixed;                  /* the slot has a mix (hle_dsound_3d.c) */
 } Stream;
 
 /* What the title asks of its streams, reported every five seconds while any
@@ -475,6 +477,22 @@ static void pump(Stream *s, uint64_t now)
           * normal -- the lead is deliberately more than one chunk -- and
           * stepping over the refusal would delete that sound from the stream
           * and leave everything after it late by its length. */
+        {
+            /* Where it is heard, and how fast: hle_dsound_3d.c. The stream's
+             * clock is the host's play position, which counts what was
+             * submitted however fast it plays. */
+            float levels[2][RECOMP_SPEAKERS], doppler = 1.0f;
+            if (hle_ds3d_mix(s->iface, s->channels, s->volume, levels, &doppler)) {
+                uint32_t asked = hle_ds3d_stream_frequency(s->iface);
+                float ratio = (asked ? (float)asked / (float)s->rate : 1.0f) * doppler;
+                recomp_audio_output_set_mix(slot_of(s), (const float (*)[RECOMP_SPEAKERS])levels,
+                                            ratio);
+                s->mixed = 1;
+            } else if (s->mixed) {
+                recomp_audio_output_clear_mix(slot_of(s));
+                s->mixed = 0;
+            }
+        }
         if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
                                         out_bits(s), s->volume))
             break;
@@ -566,6 +584,7 @@ void hle_dsound_stream_tick(uint64_t now)
 static void forget_stream(Stream *s)
 {
     recomp_audio_output_reset_voice(slot_of(s));
+    recomp_audio_output_clear_mix(slot_of(s));
     memset(s, 0, sizeof *s);
 }
 
@@ -642,6 +661,8 @@ static void record_stream(uint32_t iface, uint32_t desc)
     s->max_packets = max_packets && max_packets < MAX_PACKETS ? max_packets : MAX_PACKETS;
     s->callback    = callback;
     s->context     = context;
+    /* Whether it is 3D and the mix bins it starts with (hle_dsound_3d.c). */
+    hle_ds3d_created(iface, HLE_MEM32(desc), HLE_MEM32(desc + 0xCu));
     s->output = s->channels >= 1u && s->channels <= 2u &&
                 s->rate >= 1000u && s->rate <= 200000u &&
                 ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||

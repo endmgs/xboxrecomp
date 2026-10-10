@@ -53,6 +53,37 @@ int recomp_audio_output_submit(
 int recomp_audio_output_position(uint32_t slot, uint64_t *played_bytes,
                                  uint32_t *queued_buffers);
 
+/* The speakers a slot's sound is placed on, in the order of the Xbox's first
+   six mix bins (DSMIXBIN_FRONT_LEFT .. DSMIXBIN_BACK_RIGHT) -- which is also
+   SDL's and WAVEFORMATEXTENSIBLE's 5.1 order. */
+enum {
+    RECOMP_SPEAKER_FRONT_LEFT, RECOMP_SPEAKER_FRONT_RIGHT, RECOMP_SPEAKER_CENTER,
+    RECOMP_SPEAKER_LFE, RECOMP_SPEAKER_BACK_LEFT, RECOMP_SPEAKER_BACK_RIGHT,
+    RECOMP_SPEAKERS
+};
+
+/* Where a slot's sound goes and how fast it plays, from the next submission
+   on and for every voice the slot gets until it is changed or cleared.
+
+   levels[c][s] is the linear gain from source channel c (0, or 0 and 1 for
+   stereo) to speaker s, on top of the submission's own volume. The backend
+   folds speakers the device does not have into the ones it does (centre to
+   both fronts, backs to sides or fronts, at -3 dB; LFE where there is one).
+
+   ratio plays the slot that much faster or slower than the rate it is
+   submitted at (1 = as submitted), without restarting its voice: the
+   submitted bytes keep their meaning, and recomp_audio_output_position still
+   counts them. Clamped to 1/8..8.
+
+   A slot that never had a mix set plays exactly as before: each channel to
+   the device's default mapping, at the submitted rate. Clearing a slot's
+   mix gives its next voice that again; the voice it has now is left as it
+   is rather than restarted, which would drop what it has queued. */
+void recomp_audio_output_set_mix(uint32_t slot,
+                                 const float levels[2][RECOMP_SPEAKERS],
+                                 float ratio);
+void recomp_audio_output_clear_mix(uint32_t slot);
+
 #ifdef __cplusplus
 }
 #endif
