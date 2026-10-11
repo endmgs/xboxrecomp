@@ -33,7 +33,7 @@
  *                    capture's combiner token says.
  *   --draws <n>      execute only the first n draws (state still applied;
  *                    clears after the nth draw are skipped too).
- *   --skip-draw <n>  leave out draw n (0-based).
+ *   --skip-draw <n>  leave out draw n (0-based); <a-b> a range; may repeat.
  *   --list-draws     print every draw with the state it runs under.
  *   --dump-target    write the render target bound when the frame ends
  *                    instead of the back buffer: with --draws, the way to see
@@ -125,6 +125,20 @@ static int g_no_combiners;
  * but its own pixels. */
 static long g_max_draws = -1;
 static long g_skip_draw = -1;
+/* --skip-draw given more than once, or as a range a-b: every one is left out. */
+static struct { long lo, hi; } g_skips[64];
+static int  g_nskips;
+
+static int draw_skipped(long n)
+{
+    int i;
+    if (n == g_skip_draw)
+        return 1;
+    for (i = 0; i < g_nskips; i++)
+        if (n >= g_skips[i].lo && n <= g_skips[i].hi)
+            return 1;
+    return 0;
+}
 static int  g_list_draws;
 static int  g_dump_target;
 /* --dump-target with --draws: the target the first undrawn draw would have
@@ -265,7 +279,7 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
                 (unsigned long)rs[D3DRS_ZWRITEENABLE], (unsigned long)rs[D3DRS_FOGENABLE],
                 (unsigned long)rs[D3DRS_CULLMODE],
                 (g_max_draws >= 0 && n >= g_max_draws) ? "  (not drawn: --draws)" : "",
-                n == g_skip_draw ? "  (not drawn: --skip-draw)" : "");
+                draw_skipped(n) ? "  (not drawn: --skip-draw)" : "");
         /* The states that discard fragments without leaving a mark. */
         fprintf(stderr, "[draw %4ld] zfunc %lu afunc %lu colorwrite 0x%lX stencil %lu "
                 "fill %lu shade %lu\n", n,
@@ -311,7 +325,7 @@ static int draw_gate(const char *kind, uint32_t prim, uint32_t count, uint32_t s
         return 0;
     if (g_solo_on == 2 && g_cur_tag == g_solo_tag)
         return 0;
-    return n != g_skip_draw;
+    return !draw_skipped(n);
 }
 
 static void note(const char *fmt, ...)
@@ -1149,8 +1163,11 @@ static void do_draw_up(Replay *r, const D3D8CapChunk *c)
             for (v = 0; v < nv; v++) {
                 const float *fv = (const float *)((const uint8_t *)verts + (size_t)v * d->stride);
                 fprintf(stderr, "[draw %4ld]   vertex %u:", g_draw_index - 1, v);
-                for (uint32_t k = 0; k < n && k < 10; k++)
-                    fprintf(stderr, " %g", fv[k]);
+                /* RECOMP_REPLAY_VERTEX_ALL=1: every float, not the first ten
+                 * (a register-layout vertex is 64). */
+                uint32_t most = getenv("RECOMP_REPLAY_VERTEX_ALL") ? n : 10u;
+                for (uint32_t k = 0; k < n && k < most; k++)
+                    fprintf(stderr, "%s%g", most > 10u && k && k % 4u == 0 ? " |" : " ", fv[k]);
                 fprintf(stderr, "\n");
             }
         }
@@ -1251,7 +1268,20 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        r->dev->lpVtbl->SetRenderState(r->dev, (D3DRENDERSTATETYPE)p->state, p->value);
+        {
+            /* RECOMP_REPLAY_STATE=<state>=<value>: hold one render state at a
+             * value, to test whether it is what hides a draw. */
+            static int have = -1;
+            static unsigned long fs, fv;
+            uint32_t value = p->value;
+            if (have < 0) {
+                const char *e = getenv("RECOMP_REPLAY_STATE");
+                have = e && sscanf(e, "%lu=%lu", &fs, &fv) == 2;
+            }
+            if (have && p->state == fs)
+                value = (uint32_t)fv;
+            r->dev->lpVtbl->SetRenderState(r->dev, (D3DRENDERSTATETYPE)p->state, value);
+        }
         break;
     }
     case D3D8CAP_TEXTURE_STAGE_STATE: {
@@ -1261,8 +1291,26 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
             r->malformed++;
             break;
         }
-        r->dev->lpVtbl->SetTextureStageState(r->dev, p->stage,
-                                             (D3DTEXTURESTAGESTATETYPE)p->type, p->value);
+        {
+            /* RECOMP_REPLAY_TSS=<type>=<value>: hold one stage state at a value
+             * on every stage (16/17/18 are MAG/MIN/MIPFILTER), and print what
+             * the frame asked for, the first few times. */
+            static int have = -1;
+            static unsigned long ft, fv, said;
+            uint32_t value = p->value;
+            if (have < 0) {
+                const char *e = getenv("RECOMP_REPLAY_TSS");
+                have = e && sscanf(e, "%lu=%lu", &ft, &fv) == 2;
+            }
+            if (have && p->type == ft) {
+                if (said++ < 8)
+                    fprintf(stderr, "[replay] stage %u state %u was %u, held at %lu\n",
+                            p->stage, p->type, p->value, fv);
+                value = (uint32_t)fv;
+            }
+            r->dev->lpVtbl->SetTextureStageState(r->dev, p->stage,
+                                                 (D3DTEXTURESTAGESTATETYPE)p->type, value);
+        }
         break;
     }
     case D3D8CAP_TRANSFORM: {
@@ -1446,6 +1494,12 @@ static void replay_chunk(Replay *r, const D3D8CapChunk *c)
                     p->first_reg + 1, p->count > 1 ? data[4] : 0.f,
                     p->count > 1 ? data[5] : 0.f, p->count > 1 ? data[6] : 0.f,
                     p->count > 1 ? data[7] : 0.f);
+            /* RECOMP_REPLAY_CONST_ALL=1: every register of the update. */
+            if (getenv("RECOMP_REPLAY_CONST_ALL"))
+                for (i = 0; i < p->count; i++)
+                    fprintf(stderr, "[constants]   c%u = %g %g %g %g\n", p->first_reg + i,
+                            data[4u * i], data[4u * i + 1u], data[4u * i + 2u],
+                            data[4u * i + 3u]);
         }
         d3d8_vsh_set_constant((int)p->first_reg, data, (int)p->count);
         break;
@@ -1649,8 +1703,14 @@ static int replay_main(int argc, char **argv)
             g_no_combiners = 1;
         else if (!strcmp(argv[i], "--draws") && i + 1 < argc)
             g_max_draws = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc)
-            g_skip_draw = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--skip-draw") && i + 1 < argc) {
+            const char *a = argv[++i], *dash = strchr(a, '-');
+            if (g_nskips < 64) {
+                g_skips[g_nskips].lo = atol(a);
+                g_skips[g_nskips].hi = dash ? atol(dash + 1) : atol(a);
+                g_nskips++;
+            }
+        }
         else if (!strcmp(argv[i], "--no-scene"))
             g_no_scene = 1;
         else if (!strcmp(argv[i], "--present"))

@@ -559,6 +559,18 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
     sb_append(sb, "        float4 _mac = %s;\n", expr_buf);
 }
 
+/* RECOMP_D3D8_VSH_SPLAT_EXP=1: the old EXP/LOG, one value in every
+ * component, to tell a changed program from a changed draw. */
+static int vsh_partial_exp_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D8_VSH_SPLAT_EXP");
+        on = !(e && *e && *e != '0');
+    }
+    return on;
+}
+
 /**
  * Emit the HLSL for one ILU operation.
  */
@@ -605,15 +617,27 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_ILU_EXP:
-        /* dst = exp2(C.x).xxxx */
+        /* dst = expp(C.x): (2^floor, frac, 2^x, 1) -- see x_expp */
+        if (vsh_partial_exp_log()) {
+            sb_append(&expr, "x_expp(");
+            emit_source(&expr, &inst->ilu_src, 1);
+            sb_append(&expr, ")");
+            break;
+        }
         sb_append(&expr, "exp2(");
         emit_source(&expr, &inst->ilu_src, 1);
         sb_append(&expr, ").xxxx");
         break;
 
     case NV2A_VSH_ILU_LOG: {
-        /* dst = log2(abs(C.x)).xxxx
-         * Guard against log2(0) which is -inf on NV2A -> clamp to large negative */
+        /* dst = logp(C.x): (exponent, mantissa, log2|x|, 1) -- see x_logp */
+        if (vsh_partial_exp_log()) {
+            sb_append(&expr, "x_logp(");
+            emit_source(&expr, &inst->ilu_src, 1);
+            sb_append(&expr, ")");
+            break;
+        }
+        /* Guard against log2(0) which is -inf on NV2A -> clamp to large negative */
         sb_append(&expr, "log2(max(abs(");
         emit_source(&expr, &inst->ilu_src, 1);
         sb_append(&expr, "), 1.175494e-38)).xxxx");
@@ -752,6 +776,26 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    [[vk::builtin(\"PointSize\")]] float vk_point_size : VK_POINT_SIZE;\n"
         "#endif\n"
         "};\n\n");
+
+    /* NV2A's ILU EXP and LOG are D3D's partial-precision expp and logp, four
+     * different components, not one value splatted (Cxbx-Reloaded's x_expp
+     * and x_logp, xemu's vsh.c). Titles use the extra components: Halo 2's
+     * particle program takes expp(x).y as frac(x) to pick a sprite frame from
+     * a constant table and to blend two of them, and with exp2 splatted the
+     * index ran off the table and every light-shaft quad drew at full
+     * strength, stacking into a flat wedge across its title screen. */
+    if (vsh_partial_exp_log())
+        sb_append(&sb,
+            "float4 x_expp(float s) {\n"
+            "    float b = floor(s);\n"
+            "    return float4(exp2(b), s - b, exp2(s), 1.0);\n"
+            "}\n"
+            "float4 x_logp(float s) {\n"
+            "    float m = abs(s);\n"
+            "    if (m == 0.0) return float4(-3.402823e38, 1.0, -3.402823e38, 1.0);\n"
+            "    float e = floor(log2(m));\n"
+            "    return float4(e, m / exp2(e), log2(m), 1.0);\n"
+            "}\n\n");
 
     /* Main function */
     sb_append(&sb, "VS_OUT main(VS_IN input) {\n");

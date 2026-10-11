@@ -1129,7 +1129,8 @@ class FunctionDetector:
                 # so the first test cannot see them yet; it sits after a nop
                 # on a 16-byte boundary. A lone word gets only this route.
                 if lone:
-                    if not self._is_padded_entry(target):
+                    if not (self._is_padded_entry(target)
+                            or self._is_ret_adjacent_entry(target)):
                         continue
                 elif not self.engine.probes_as_function_body(target,
                                                              max_insns=64):
@@ -1203,6 +1204,33 @@ class FunctionDetector:
         if self.engine.entry_pops_unsaved(addr):
             return False
         return self.engine.probes_as_function_body(addr)
+
+    def _is_ret_adjacent_entry(self, addr: int) -> bool:
+        """Is `addr` a function start with no padding in front of it: 16-byte
+        aligned, straight after a ret, short enough to reach its own ret within
+        the strict probe, and not unwinding registers it never saved?
+
+        When a function's last instruction ends exactly on a 16-byte boundary
+        the compiler has nothing to pad, so the next function begins right
+        after the ret. Halo 2's tag-field accessors are laid out that way --
+        each `ret 0Ch` runs straight into the next `movsx eax, word [esp+4]` --
+        and are named only by lone words in its field-definition records.
+        _is_padded_entry wanted int3 or nop before them; 0x002A89B0,
+        0x002A8C20 and 0x002AC4B0 were each found only as the unresolved call
+        a level load spun on. A ret is as good a boundary as padding, and the
+        alignment and the short returning body keep coincidences out.
+        """
+        if addr % 16 != 0:
+            return False
+        ends_in_ret = False
+        for a in range(addr - 3, addr):
+            insn = self.engine.instructions.get(a)
+            if insn is not None and insn.address + insn.size == addr:
+                ends_in_ret = bool(insn.is_ret)
+                break
+        if not ends_in_ret or self.engine.entry_pops_unsaved(addr):
+            return False
+        return self.engine.probes_as_function_body(addr, max_insns=64)
 
     def _starts_after_boundary(self, addr: int) -> bool:
         """Is `addr` where a function entry can begin: right after padding

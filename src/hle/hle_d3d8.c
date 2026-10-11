@@ -77,8 +77,19 @@
 #include "rhi.h"                         /* rhi_set_wait_hooks */
 #include "../kernel/xbox_memory_layout.h"  /* the guest lock */
 
+void hle_d3d8_push_constants_sync(void);   /* hle_d3d8_vertex.c */
+void hle_d3d8_push_skip(void);
+int  hle_d3d8_pb_inline_on(void);
+
+/* Every replacement starts here. Beyond the one-time log line, it brings the
+ * push-buffer walk up to date first (hle_d3d8_vertex.c): what the title wrote
+ * there itself -- constants, and with RECOMP_HLE_D3D8_PB_INLINE immediate-mode
+ * draws -- happened before this call, so it is applied with the state from
+ * before this call. */
 static void first_call(int *seen, const char *name, uint32_t arg)
 {
+    if (hle_d3d8_pb_inline_on())
+        hle_d3d8_push_constants_sync();
     if (!*seen) {
         *seen = 1;
         fprintf(stderr, "[HLE] %s(0x%X) replaced by name\n", name, arg);
@@ -1737,8 +1748,52 @@ int hle_d3d8_dump_back_buffer(const char *path)
     return dump_back_buffer(path);
 }
 
+/* RECOMP_RAM_DUMP=<prefix> with RECOMP_RAM_DUMP_SWAPS=<n>[,<n>...]: guest
+ * RAM, 0 to the end of title memory, written to <prefix>_<swap>.bin at those
+ * swaps. For finding a structure by what changed between two moments of a
+ * run -- a string the title typed, a counter that moved -- when nothing yet
+ * says where it lives. */
+static void ram_dump_at_swap(void)
+{
+    static int parsed;
+    static unsigned long want[16];
+    static int nwant;
+    const char *prefix = getenv("RECOMP_RAM_DUMP");
+    int i;
+
+    if (!prefix || !*prefix)
+        return;
+    if (!parsed) {
+        const char *e = getenv("RECOMP_RAM_DUMP_SWAPS");
+        parsed = 1;
+        while (e && *e && nwant < 16) {
+            char *end;
+            want[nwant] = strtoul(e, &end, 0);
+            if (end == e)
+                break;
+            nwant++;
+            e = *end == ',' ? end + 1 : end;
+        }
+    }
+    for (i = 0; i < nwant; i++) {
+        if (want[i] == g_shadow_swaps) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s_%lu.bin", prefix, g_shadow_swaps);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(HLE_PTR(0), 1, g_xbox_total_ram, f);
+                fclose(f);
+                fprintf(stderr, "[RAM-DUMP] swap %lu: %lu bytes to %s\n", g_shadow_swaps,
+                        (unsigned long)g_xbox_total_ram, path);
+            }
+        }
+    }
+}
+
 static void shadow_dump_frame(void)
 {
+    ram_dump_at_swap();
     static const char *prefix;
     static int configured, every = 300, written, keep_last;
     static unsigned long min_draws, last_dump, from_swap;
@@ -2105,6 +2160,16 @@ static int original_missing(void (*fn)(void), const char *name)
     return 1;
 }
 
+/* Whether the title's Direct3D is an LTCG build, which inlines the small
+ * device calls at their uses: known from CreateDevice, which such a build
+ * enters through a register-argument thunk (g_hle_ltcg_nargs). */
+static int g_title_ltcg;
+
+int hle_d3d8_title_ltcg(void)
+{
+    return g_title_ltcg;
+}
+
 /* HRESULT Direct3D_CreateDevice(UINT Adapter, D3DDEVTYPE DeviceType,
  *     HWND hFocusWindow, DWORD BehaviorFlags,
  *     D3DPRESENT_PARAMETERS *pPresentationParameters,
@@ -2112,12 +2177,17 @@ static int original_missing(void (*fn)(void), const char *name)
 HLE_EXPORT(Direct3D_CreateDevice)
 {
     static int seen;
-    uint32_t pp_va = HLE_ARG(4);
+    /* The LTCG build of 5849 (Halo 2's Direct3D_CreateDevice_4__LTCG_eax1_ecx3)
+     * keeps only three arguments: BehaviorFlags in eax, the presentation
+     * parameters on the stack, the returned-device pointer in ecx. Its thunk
+     * builds a three-argument frame, so they are found at 1, not 4. */
+    uint32_t pp_va = g_hle_ltcg_nargs == 3 ? HLE_ARG(1) : HLE_ARG(4);
 
     first_call(&seen, "Direct3D_CreateDevice", pp_va);
     if (original_missing(hle_original_Direct3D_CreateDevice, "Direct3D_CreateDevice"))
         HLE_RETURN(0x80004005u);                 /* E_FAIL */
     g_in_create_device = 1;
+    g_title_ltcg = g_hle_ltcg_nargs != 0;
     /* Before the original, not after: some XDKs wait on the fence inside
      * CreateDevice itself. XGRA's (5558) calls D3D_KickOffAndWaitForIdle
      * there and spun in D3D_BlockOnTime before the device was ever returned.
@@ -2161,6 +2231,7 @@ HLE_EXPORT(D3DDevice_Clear)
     if (original_missing(hle_original_D3DDevice_Clear, "D3DDevice_Clear"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_Clear);
+    hle_d3d8_push_skip();   /* its own clear methods: cleared here, not by the walk */
     if (g_shadow) {
         float z;
 
@@ -2198,6 +2269,49 @@ HLE_EXPORT(D3DDevice_Clear)
         if (shadow_trace_on())
             fprintf(stderr, "[TRACE swap %lu] (after %lu draws) Clear flags 0x%X color 0x%08X\n",
                     g_shadow_swaps, g_frame_draws, flags, color);
+    }
+}
+
+/* A clear the title wrote into the push buffer itself (Halo 2 inlines
+ * D3DDevice_Clear): NV097_CLEAR_SURFACE with the clear values and rectangle
+ * set before it, handed over by the push-buffer walk (hle_d3d8_vertex.c).
+ * The surface bits are D3DCLEAR's (Z 0x01, stencil 0x02, colour 0xF0). The
+ * depth-stencil value is in the depth surface's format: D16 in the low half,
+ * otherwise 24 bits of depth over 8 of stencil. Unseen, the title's depth
+ * surface kept the first frame's depth for good and every later draw with a
+ * depth test failed it: Halo 2's menu drew nothing but its particles. The
+ * rectangle is inclusive, in target pixels. */
+void hle_d3d8_pb_clear(uint32_t surface, uint32_t color, uint32_t zstencil,
+                       uint32_t horizontal, uint32_t vertical)
+{
+    D3DRECT rect;
+    float z;
+    uint32_t stencil = 0;
+    int whole;
+
+    if (!g_shadow || !(surface & 0xF3u))
+        return;
+    if (g_z_scale == 65535.0f) {
+        z = (float)(zstencil & 0xFFFFu) / 65535.0f;
+    } else {
+        z = (float)(zstencil >> 8) / 16777215.0f;
+        stencil = zstencil & 0xFFu;
+    }
+    rect.x1 = (LONG)(horizontal & 0xFFFFu);
+    rect.x2 = (LONG)(horizontal >> 16) + 1;
+    rect.y1 = (LONG)(vertical & 0xFFFFu);
+    rect.y2 = (LONG)(vertical >> 16) + 1;
+    whole = !horizontal || (rect.x1 <= 0 && rect.y1 <= 0 &&
+                            rect.x2 >= (LONG)g_target_width && rect.y2 >= (LONG)g_target_height);
+    host_Clear(g_shadow, whole ? 0 : 1, whole ? NULL : &rect,
+               xbox_clear_flags_to_host(surface), color, z, stencil);
+    g_shadow_clears++;
+    {
+        static unsigned long said;
+        if (said++ < 3)
+            fprintf(stderr, "[HLE-D3D8] push buffer clear: surface 0x%02X color 0x%08X "
+                    "z %g stencil %u rect %ld,%ld-%ld,%ld\n", surface, color, z, stencil,
+                    (long)rect.x1, (long)rect.y1, (long)rect.x2, (long)rect.y2);
     }
 }
 
@@ -3393,6 +3507,62 @@ static void inline_draw_program(uint32_t n)
     g_inline_drawn++;
 }
 
+void hle_d3d8_shadow_draw_indexed(uint32_t xpt, uint32_t count, const uint16_t *idx,
+                                  const void *verts, uint32_t stride, int from_buffer);
+
+/* Vertices as the NV2A feeds a vertex program: sixteen float4 input registers
+ * each, v0..v15 at 16 * register. The push-buffer walk (hle_d3d8_vertex.c)
+ * builds these from the title's own vertex arrays for its array draws, as
+ * the hardware reads them -- SET_VERTEX_DATA_ARRAY_FORMAT says what each
+ * register's array holds, and no D3D declaration is involved. Halo 2 selects
+ * programs that have none, and its draws were skipped as "program without
+ * layout". Drawn under the current program with the sixteen-register layout
+ * the immediate-mode path already uses, and its own declaration put back.
+ * 1 when drawn; 0 when no host program is selected (the caller then falls
+ * back to the declaration path). `idx` NULL for a non-indexed draw. */
+int hle_d3d8_draw_registers(uint32_t xpt, uint32_t nverts, const float (*verts)[16][4],
+                            const uint16_t *idx, uint32_t nidx)
+{
+    struct shadow_program *p, saved;
+    D3D8VshInput in[16];
+    int i;
+
+    if (!g_shadow || !g_shadow_vs_is_program || g_shadow_vs_kind != SHADER_HOST_PROGRAM ||
+        g_shadow_vs_slot < 0)
+        return 0;
+    p = &g_programs[g_shadow_vs_slot];
+    for (i = 0; i < 16; i++) {
+        in[i].reg = i;
+        in[i].format = RHI_FORMAT_R32G32B32A32_FLOAT;
+        in[i].offset = (UINT)i * 16u;
+    }
+    if (FAILED(host_vsh_set_declaration(p->host, in, 16)))
+        return 0;
+    saved = *p;
+    p->has_declaration = 1;
+    p->extent = 16u * 16u;
+    p->packed_count = 0;
+    p->other_streams = 0;
+    p->expanded_bytes = 0;
+    p->base_stream = 0;
+    if (idx)
+        hle_d3d8_shadow_draw_indexed(xpt, nidx, idx, verts, 16u * 16u, 0);
+    else
+        hle_d3d8_shadow_draw(xpt, nverts, verts, 16u * 16u, 0);
+    *p = saved;
+    if (saved.has_declaration)
+        shadow_read_declaration(g_shadow_vs_slot, g_shadow_vs);
+    return 1;
+}
+
+/* The current value of each input register (SET_VERTEX_DATA* outside a
+ * begin/end pair, g_inline_cur): what a program reads from a register no
+ * array feeds. */
+void hle_d3d8_current_registers(float out[16][4])
+{
+    memcpy(out, g_inline_cur, sizeof g_inline_cur);
+}
+
 /* The recorded vertices in the current FVF's layout, drawn. */
 static void inline_draw(void)
 {
@@ -3452,6 +3622,114 @@ static void inline_draw(void)
     g_inline_drawn++;
 }
 
+/* ------------------------------------------------------------------------
+ * Immediate-mode vertices from the push buffer.
+ *
+ * Halo 2's LTCG build inlines D3DDevice_Begin, SetVertexData2f and End at
+ * every use: its loading screen and movie quads are SET_BEGIN_END,
+ * SET_VERTEX_DATA2F (position, texture coordinate), SET_VERTEX_DATA4UB and
+ * SET_BEGIN_END 0, written straight into the push buffer, with no call this
+ * file replaces. The push-buffer walk (hle_d3d8_vertex.c) hands those methods
+ * here in order, and they take the same path as the replaced Begin / End:
+ * inline_vertex_data() collects the vertices, inline_draw() draws them under
+ * the current vertex shader and textures. Outside a begin/end pair a write is
+ * the attribute's current value, as the NV2A treats it.
+ *
+ * The replacements whose own bodies write these methods (Begin, End,
+ * SetVertexData*) move the walk past their writes, so no group is drawn
+ * twice. RECOMP_HLE_D3D8_PB_INLINE=0 turns it off.
+ * ------------------------------------------------------------------------ */
+static unsigned long g_pbi_groups, g_pbi_drawn;
+static int           g_pbi_group;
+static float         g_pbi_part[16][4];
+
+int hle_d3d8_pb_inline_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_INLINE", 1);
+    return on && g_shadow;
+}
+
+static void pbi_attribute(uint32_t reg, const float v[4])
+{
+    if (!inline_vertex_data(reg, v) && g_shadow) {
+        if (reg < 16u)
+            memcpy(g_inline_cur[reg], v, sizeof g_inline_cur[reg]);
+        host_vsh_set_vertex_data((int)reg, v);
+    }
+}
+
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format);
+
+void hle_d3d8_pb_inline_method(uint32_t method, uint32_t value)
+{
+    static uint32_t tex_data[4];
+    float f, v[4];
+
+    if (method >= 0x1B00u && method < 0x1C00u) {     /* SET_TEXTURE_OFFSET / _FORMAT */
+        uint32_t stage = (method - 0x1B00u) / 0x40u;
+        if ((method & 0x3Cu) == 0x00u)
+            tex_data[stage] = value;
+        else if ((method & 0x3Cu) == 0x04u)
+            hle_d3d8_texture_by_state(stage, tex_data[stage], value);
+        return;
+    }
+
+    if (method == 0x17FCu) {                         /* SET_BEGIN_END */
+        if (value) {
+            g_inline_on = 1;
+            g_inline_xpt = value;
+            g_inline_nverts = 0;
+            g_pbi_group = 1;
+        } else if (g_pbi_group) {
+            g_pbi_groups++;
+            if (g_inline_nverts) {
+                inline_draw();
+                g_pbi_drawn++;
+            }
+            g_inline_on = 0;
+            g_inline_nverts = 0;
+            g_pbi_group = 0;
+            if (g_pbi_groups == 1 || (g_pbi_groups % 10000u) == 0)
+                fprintf(stderr, "[HLE-D3D8] push buffer immediate mode: %lu begin/end "
+                        "group(s), %lu drawn\n", g_pbi_groups, g_pbi_drawn);
+        }
+        return;
+    }
+    memcpy(&f, &value, sizeof f);
+    if (method >= 0x1880u && method < 0x1900u) {     /* SET_VERTEX_DATA2F_M */
+        uint32_t reg = (method - 0x1880u) / 8u, comp = ((method - 0x1880u) / 4u) & 1u;
+        g_pbi_part[reg][comp] = f;
+        if (comp == 1u) {
+            v[0] = g_pbi_part[reg][0]; v[1] = g_pbi_part[reg][1]; v[2] = 0.0f; v[3] = 1.0f;
+            pbi_attribute(reg, v);
+        }
+    } else if (method >= 0x1900u && method < 0x1940u) {   /* SET_VERTEX_DATA2S */
+        v[0] = (float)(int16_t)(value & 0xFFFFu);
+        v[1] = (float)(int16_t)(value >> 16);
+        v[2] = 0.0f; v[3] = 1.0f;
+        pbi_attribute((method - 0x1900u) / 4u, v);
+    } else if (method >= 0x1940u && method < 0x1980u) {   /* SET_VERTEX_DATA4UB */
+        v[0] = (float)( value        & 0xFFu) / 255.0f;
+        v[1] = (float)((value >>  8) & 0xFFu) / 255.0f;
+        v[2] = (float)((value >> 16) & 0xFFu) / 255.0f;
+        v[3] = (float)((value >> 24) & 0xFFu) / 255.0f;
+        pbi_attribute((method - 0x1940u) / 4u, v);
+    } else if (method >= 0x1980u && method < 0x1A00u) {   /* SET_VERTEX_DATA4S_M */
+        uint32_t reg = (method - 0x1980u) / 8u, half = ((method - 0x1980u) / 4u) & 1u;
+        g_pbi_part[reg][half * 2u]      = (float)(int16_t)(value & 0xFFFFu);
+        g_pbi_part[reg][half * 2u + 1u] = (float)(int16_t)(value >> 16);
+        if (half == 1u)
+            pbi_attribute(reg, g_pbi_part[reg]);
+    } else if (method >= 0x1A00u && method < 0x1B00u) {   /* SET_VERTEX_DATA4F_M */
+        uint32_t reg = (method - 0x1A00u) / 16u, comp = ((method - 0x1A00u) / 4u) & 3u;
+        g_pbi_part[reg][comp] = f;
+        if (comp == 3u)
+            pbi_attribute(reg, g_pbi_part[reg]);
+    }
+}
+
 /* void D3DDevice_SetVertexDataColor(INT Register, D3DCOLOR Color)
  * The current value of an input register: what a vertex program reads from a
  * register the vertex does not carry. Burnout 2 sets v3, the diffuse colour,
@@ -3467,6 +3745,7 @@ HLE_EXPORT(D3DDevice_SetVertexDataColor)
                          "D3DDevice_SetVertexDataColor"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexDataColor);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         float v[4];
 
@@ -3491,6 +3770,7 @@ HLE_EXPORT(D3DDevice_SetVertexData2f)
                          "D3DDevice_SetVertexData2f"))
         return;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData2f);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
@@ -3533,6 +3813,7 @@ HLE_EXPORT(D3DDevice_Begin)
     g_inline_begin++;
     g_inline_begin_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_Begin);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     g_inline_on = 1;
     g_inline_xpt = HLE_ARG(0);
     g_inline_nverts = 0;
@@ -3548,6 +3829,7 @@ HLE_EXPORT(D3DDevice_End)
         return;
     g_inline_end++;
     HLE_CALL_ORIGINAL(D3DDevice_End);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_inline_on) {
         inline_draw();
         g_inline_on = 0;
@@ -3716,6 +3998,7 @@ HLE_EXPORT(D3DDevice_EndPush)
                 "%lu stopped at another method, %lu with no vertex size\n",
                 g_push_count, g_push_draws, g_push_other, g_push_nostride);
     HLE_CALL_ORIGINAL(D3DDevice_EndPush);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
 }
 
 /* void D3DDevice_SetVertexData4f(INT Register, float a, float b, float c,
@@ -3731,6 +4014,7 @@ HLE_EXPORT(D3DDevice_SetVertexData4f)
     g_inline_vdata++;
     g_inline_vdata_frame++;
     HLE_CALL_ORIGINAL(D3DDevice_SetVertexData4f);
+    hle_d3d8_push_skip();   /* its own vertex writes: drawn here, not by the walk */
     if (g_shadow) {
         uint32_t w[4] = { HLE_ARG(1), HLE_ARG(2), HLE_ARG(3), HLE_ARG(4) };
         float v[4];
@@ -4118,6 +4402,41 @@ static IDirect3DSurface8 *depth_texture_surface(uint32_t texture_va)
     return cache[i].surface;
 }
 
+static int nodepth_zscale_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_NODEPTH_ZSCALE", 1);
+    return on;
+}
+
+static int share_device_depth_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_SHARE_DEVICE_DEPTH", 1);
+    return on;
+}
+
+/* Whether the host's device depth is the size of level `level` of a host
+ * render-target texture -- the host refuses a depth of another size. */
+static int device_depth_fits(IDirect3DTexture8 *texture, UINT level)
+{
+    D3DSURFACE_DESC dd, td;
+
+    if (!g_device_depth ||
+        FAILED(g_device_depth->lpVtbl->GetDesc(g_device_depth, &dd)) ||
+        FAILED(texture->lpVtbl->GetLevelDesc(texture, level, &td)))
+        return 0;
+    return dd.Width == td.Width && dd.Height == td.Height;
+}
+
+/* The guest data of the surface the screen is drawn into now, and of the
+ * depth bound with it, as shadow_set_render_target last saw them: for
+ * hle_d3d8_pb_surface. */
+static uint32_t g_bound_color_data, g_bound_zeta_data, g_bound_zs, g_bound_rt_va;
+static int      g_bound_kind = -1;
+
 static void shadow_set_render_target(uint32_t rt, uint32_t zs)
 {
     static struct { uint32_t va; int kind; } seen[32];
@@ -4134,6 +4453,7 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     if (!rt)
         rt = current_rt;
     current_rt = rt;
+    g_bound_rt_va = rt;
     g_target_sets++;
     if (!rt) {
         kind = 0;
@@ -4347,12 +4667,38 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
                     g_shadow_map_big_sets++;
             }
         }
+        /* The device's own depth behind an offscreen target of its size:
+         * the same memory on the console, so what this pass writes is what
+         * the next pass to the screen tests against. Halo 2 lays its scene's
+         * depth down into a 640x480 texture with the device depth, then
+         * draws the screen with ZFUNC EQUAL against it; with a scratch depth
+         * here the screen pass tested against the clear value and drew
+         * nothing. RECOMP_HLE_D3D8_SHARE_DEVICE_DEPTH=0 for the scratch. */
+        if (!depth && kind != 0 && kind != 3 && own && g_device_depth && texture &&
+            share_device_depth_on() && device_depth_fits(texture, level))
+            depth = g_device_depth;
         if (!depth)
             depth = depth_surface(w, h);
         g_target_shadow_map = depth && depth_texture_of(zs) && zw == w && zh == h &&
                               shadow_maps_on() && kind != 0;
     } else {
+        /* No depth surface: Z decides nothing but clipping, and the scale
+         * is the device depth's. A program that writes the XDK's reserved
+         * viewport constants gets them from this same scale
+         * (shadow_viewport_constants), so the two agree whatever it is; a
+         * title that keeps its own screen transform wrote it for the depth
+         * buffer it has. Halo 2's interface programs scale Z by 2^24-1
+         * (c10) and draw with no depth bound; undone at a scale of 1, every
+         * glyph of its menus came out 8 million deep and was clipped, so
+         * the main menu showed nothing but its darkened background.
+         * RECOMP_HLE_D3D8_NODEPTH_ZSCALE=0 for the old scale of 1. */
         g_z_scale = 1.0f;
+        if (g_autodepth_va && nodepth_zscale_on()) {
+            UINT aw, ah;
+            uint32_t afmt = 0;
+            surface_measure(g_autodepth_va, &aw, &ah, &afmt);
+            g_z_scale = xbox_depth_z_scale(afmt);
+        }
         g_target_shadow_map = 0;
     }
 
@@ -4382,6 +4728,10 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     }
     g_target_width = w;
     g_target_height = h;
+    g_bound_kind = kind;
+    g_bound_color_data = rt ? (HLE_MEM32(rt + 4) & 0x0FFFFFFFu) : 0;
+    g_bound_zeta_data = zs ? (HLE_MEM32(zs + 4) & 0x0FFFFFFFu) : 0;
+    g_bound_zs = zs;
 
     /* The Xbox resets the viewport to the whole new target. */
     g_title_viewport.X = 0;
@@ -4393,6 +4743,52 @@ static void shadow_set_render_target(uint32_t rt, uint32_t zs)
     g_title_viewport_set = 1;
     g_host_viewport_mode = -1;
     shadow_viewport_constants(&g_title_viewport);
+}
+
+/* A render-target switch the title wrote into the push buffer itself, seen
+ * by the walk (hle_d3d8_vertex.c): SET_SURFACE_COLOR_OFFSET and
+ * SET_SURFACE_ZETA_OFFSET, physical. Only the depth half is followed, and
+ * only while the colour surface is still the one bound: the XDK's own Swap
+ * puts the device depth back under the new back buffer without a
+ * SetRenderTarget, and Halo 2 does the same after its post-processing, so
+ * the Clear that starts its next frame -- which the console applies to the
+ * device depth -- found no depth on the host, and the depth surface was
+ * never cleared again. A zeta offset of 0 is no depth. */
+void hle_d3d8_pb_surface(uint32_t color, uint32_t zeta)
+{
+    static int on = -1;
+    uint32_t zs;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_PB_SURFACE", 1);
+    if (!on || !g_shadow || g_bound_kind < 0)
+        return;
+    color &= 0x0FFFFFFFu;
+    zeta &= 0x0FFFFFFFu;
+    if (zeta == g_bound_zeta_data)
+        return;
+    if (color != g_bound_color_data) {
+        /* After a Swap the back buffer is the other frame buffer. */
+        int i, screen = 0;
+        for (i = 0; i < g_nswap && g_bound_kind == 0; i++)
+            if ((g_swap_data[i] & 0x0FFFFFFFu) == color)
+                screen = 1;
+        if (!screen)
+            return;
+    }
+    if (!zeta)
+        zs = 0;
+    else if (g_autodepth_va && zeta == (HLE_MEM32(g_autodepth_va + 4) & 0x0FFFFFFFu))
+        zs = g_autodepth_va;
+    else
+        return;                          /* a depth surface this cannot name */
+    {
+        static unsigned long said;
+        if (said++ < 3)
+            fprintf(stderr, "[HLE-D3D8] push buffer surface: depth 0x%08X under colour "
+                    "0x%08X, set by the title's own writes\n", zeta, color);
+    }
+    shadow_set_render_target(g_bound_rt_va, zs);
 }
 
 /* void D3DDevice_InsertCallback(D3DCALLBACKTYPE Type, D3DCALLBACK pCallback,
@@ -5108,6 +5504,7 @@ HLE_EXPORT(D3DDevice_DrawVerticesUP)
     if (original_missing(hle_original_D3DDevice_DrawVerticesUP, "D3DDevice_DrawVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawVerticesUP);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (data)
         hle_d3d8_shadow_draw(xpt, count, HLE_PTR(data), stride, 0);
 }
@@ -5128,6 +5525,7 @@ HLE_EXPORT(D3DDevice_DrawIndexedVerticesUP)
                          "D3DDevice_DrawIndexedVerticesUP"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_DrawIndexedVerticesUP);
+    hle_d3d8_push_skip();   /* its own draw methods: drawn here, not by the walk */
     if (index_va && data)
         hle_d3d8_shadow_draw_indexed(xpt, count, (const uint16_t *)HLE_PTR(index_va),
                                      HLE_PTR(data), stride, 0);

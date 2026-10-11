@@ -601,12 +601,28 @@ static int vsh_do_ilu(NV2AVshIluOp op, const float c[4], float r[4])
         vsh_splat(r, m == 0.0f ? FLT_MAX : 1.0f / sqrtf(m));
         break;
     }
-    case NV2A_VSH_ILU_EXP:
-        vsh_splat(r, powf(2.0f, x));
+    case NV2A_VSH_ILU_EXP: {
+        /* expp: (2^floor(x), frac(x), 2^x, 1), as the HLSL generator's
+         * x_expp (d3d8_vsh.c), not one value in every component. */
+        float b = floorf(x);
+        r[0] = powf(2.0f, b);
+        r[1] = x - b;
+        r[2] = powf(2.0f, x);
+        r[3] = 1.0f;
         break;
+    }
     case NV2A_VSH_ILU_LOG: {
+        /* logp: (exponent, mantissa, log2|x|, 1), as x_logp. */
         float m = x < 0.0f ? -x : x;
-        vsh_splat(r, m == 0.0f ? -FLT_MAX : log2f(m));
+        if (m == 0.0f) {
+            r[0] = -FLT_MAX; r[1] = 1.0f; r[2] = -FLT_MAX; r[3] = 1.0f;
+        } else {
+            float e = floorf(log2f(m));
+            r[0] = e;
+            r[1] = m / powf(2.0f, e);
+            r[2] = log2f(m);
+            r[3] = 1.0f;
+        }
         break;
     }
     case NV2A_VSH_ILU_LIT: {

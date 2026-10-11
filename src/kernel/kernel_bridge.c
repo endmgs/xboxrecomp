@@ -29,6 +29,8 @@
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include "platform/host_timer.h"   /* the vblank clock's precise sleep */
+#include "platform/host_main.h"    /* host_relaunch_self: a quick reboot into this title */
+#include "recomp_config.h"         /* recomp_config_title_id */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -232,8 +234,33 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *relaunch = getenv("RECOMP_LAUNCH_DATA");
+        int carried = 0;
 
-        if (cmdline && *cmdline) {
+        /* A title that quick-rebooted into itself (bridge_HalReturnToFirmware)
+         * left its whole launch data page here, hex-encoded: this is the boot
+         * after that reboot, and XGetLaunchInfo must see what the title
+         * wrote. It wins over RECOMP_CMDLINE, which only seeds a first boot. */
+        if (relaunch && strlen(relaunch) == 2 * 0x1000) {
+            uint32_t page = xbox_HeapAlloc(0x1000, 4096);
+            if (page) {
+                uint32_t i;
+
+                for (i = 0; i < 0x1000; i++) {
+                    unsigned v = 0;
+                    sscanf(relaunch + 2 * i, "%2x", &v);
+                    BRIDGE_MEM8(page + i) = (uint8_t)v;
+                }
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = page;
+                fprintf(stderr, "  Launch data: carried over the relaunch, type %u"
+                                " titleid 0x%08X at 0x%08X\n",
+                        BRIDGE_MEM32(page), BRIDGE_MEM32(page + 4), page);
+                carried = 1;
+            }
+        }
+        if (carried) {
+            /* the page above */
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -1359,6 +1386,45 @@ static void bridge_HalReturnToFirmware(void)
         fflush(stderr);
     }
 
+    /* A quick reboot into the same title. XLaunchNewImage with no path (or
+     * the update launcher, as Halo 2 does at its first boot) fills the page
+     * with the title's own ID and an empty path and reboots: on a console the
+     * same image starts again and XGetLaunchInfo hands it the page. Do that
+     * -- re-execute with the page in RECOMP_LAUNCH_DATA -- instead of ending
+     * the process, a few times at most so a title that relaunches on every
+     * boot still stops. RECOMP_RELAUNCH=0 restores the plain exit. */
+    {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        const char *off = getenv("RECOMP_RELAUNCH");
+        const char *cnt = getenv("RECOMP_RELAUNCH_COUNT");
+        int count = cnt ? atoi(cnt) : 0;
+
+        if (routine == 2 && page && !(off && *off == '0') && count < 3
+                && BRIDGE_MEM32(page + 4) == recomp_config_title_id()
+                && BRIDGE_MEM8(page + 8) == 0) {
+            static char hex[2 * 0x1000 + 1];
+            char next[16];
+            uint32_t i;
+
+            for (i = 0; i < 0x1000; i++)
+                snprintf(hex + 2 * i, 3, "%02X", BRIDGE_MEM8(page + i));
+            snprintf(next, sizeof next, "%d", count + 1);
+#ifdef _WIN32
+            SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", hex);
+            SetEnvironmentVariableA("RECOMP_RELAUNCH_COUNT", next);
+#else
+            setenv("RECOMP_LAUNCH_DATA", hex, 1);
+            setenv("RECOMP_RELAUNCH_COUNT", next, 1);
+#endif
+            fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=2 into this title"
+                            " - relaunching with its launch data (relaunch %d of at most 3;"
+                            " RECOMP_RELAUNCH=0 to exit instead)\n", count + 1);
+            fflush(stderr);
+            host_relaunch_self();
+            fprintf(stderr, "  [KERNEL] relaunch failed; exiting instead\n");
+        }
+    }
+
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
@@ -1610,6 +1676,19 @@ static volatile LONG *bridge_guest_event(uint32_t va, int *sync)
 {
     uint8_t type;
 
+    /* An event in contiguous memory, at XBOX_CONTIG_BASE + its physical
+     * address: the same RAM, seen through the window. Halo 2 keeps the
+     * completion events of its DirectSound stream packets there; read as a
+     * handle, the address reached the host's SetEvent and faulted. */
+    if (va >= XBOX_CONTIG_BASE + 0x00010000u &&
+        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - 8u) {
+        type = *(volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
+        if (type != GUEST_EVENT_NOTIFICATION && type != GUEST_EVENT_SYNCHRONIZATION)
+            return NULL;
+        if (sync)
+            *sync = (type == GUEST_EVENT_SYNCHRONIZATION);
+        return (volatile LONG *)((uintptr_t)va + 4u + g_xbox_mem_offset);
+    }
     if (va < 0x00010000u || va >= GUEST_RAM_END - 8u)
         return NULL;
     type = *(volatile uint8_t *)((uintptr_t)va + g_xbox_mem_offset);
@@ -2438,7 +2517,17 @@ static void bridge_MmSetAddressProtect(void)
     uint32_t addr = STACK_ARG(0);
     uint32_t size = STACK_ARG(1);
     uint32_t prot = STACK_ARG(2);
+    static int said;
 
+    /* Which pages a title protects, and how: a 4 KB protection on a POSIX
+     * host takes the whole 16 KB host page with it (see xbox_fault_route.c,
+     * RECOMP_FAULT_STATS), so this is the first thing to read when a profile
+     * fills with _sigtramp. The first 64 calls. */
+    if (said < 64) {
+        said++;
+        fprintf(stderr, "  [KERNEL] MmSetAddressProtect: 0x%08X..0x%08X protect 0x%X\n",
+                addr, addr + size, prot);
+    }
     xbox_MmSetAddressProtect(XBOX_TO_NATIVE(addr), size, prot);
     g_eax = 0;
 }
@@ -3701,6 +3790,21 @@ static HANDLE bridge_take_handle(uint32_t token)
  * file that is handed a guest HANDLE: a DirectSound stream packet's completion
  * event (src/hle/hle_dsound_stream.c). Same rule as the bridges: a tagged token
  * goes through the table, anything else passes through unchanged. */
+/* For the HLE: set a dispatcher object the title built in its own memory
+ * (a KEVENT, which KeSetEvent sets in place), if `va` is one. 1 when it was;
+ * 0 means `va` is a handle, to resolve with xbox_bridge_resolve_handle. A
+ * packet's hCompletionEvent may be either. */
+int xbox_bridge_set_guest_event(uint32_t va)
+{
+    volatile LONG *state = bridge_guest_event(va, NULL);
+
+    if (!state)
+        return 0;
+    InterlockedExchange(state, 1);
+    event_wake_waiters(va);
+    return 1;
+}
+
 void *xbox_bridge_resolve_handle(uint32_t token)
 {
     return (void *)bridge_resolve_handle(token);
@@ -8872,7 +8976,11 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
     DWORD old = 0;
 
+#ifdef _WIN32
     if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+#else
+    if (w32_guest_protect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+#endif
         if (old_ptr)
             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
         g_eax = 0;  /* STATUS_SUCCESS */

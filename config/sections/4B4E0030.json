@@ -1,0 +1,16 @@
+{
+ "data": [
+  {
+   "pattern": "OA0[0-9A-F][0-9A-F]_RD",
+   "note": "Pro Evolution Soccer 5: read-only data halves of the demand-loaded overlays (OA001_RD..OA019_RD). The code halves are the matching OA0xx_CD sections, which stay code. Checked against disasm/xrefs.json after the first lift: no call or jump lands in an _RD section."
+  },
+  {
+   "pattern": "OA0[0-9A-F][0-9A-F]_RW",
+   "note": "Pro Evolution Soccer 5: writable data and BSS of the overlays (OA003_RW, OA006_RW .. OA020_RW; several have a 4-byte raw size and 0.1-1.1 MB virtual). Checked as for _RD."
+  },
+  {
+   "pattern": "XON_RD",
+   "note": "Pro Evolution Soccer 5: the XONLINE library's read-only data. Swept as code it gave 28 phantom functions holding 3,597 of the lift's 4,845 unimplemented instructions (outsb/insb/arpl...). Checked in disasm/xrefs.json: no call or jump from outside the section lands in it."
+  }
+ ]
+}

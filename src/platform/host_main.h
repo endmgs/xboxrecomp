@@ -64,6 +64,14 @@ int host_symbol_name(uintptr_t addr, char *name, size_t bytes, uintptr_t *offset
  * unknown. */
 int host_module_range(uintptr_t *lo, uintptr_t *hi);
 
+/* Start this executable again, with the same arguments and the current
+ * environment, and end this process: what a console's quick reboot into the
+ * same title amounts to. POSIX: execv, so the process id (and anything
+ * waiting on it, a timeout included) carries over. Windows: CreateProcess
+ * with the standard handles inherited, then ExitProcess. Returns only when
+ * the new image could not be started. */
+int host_relaunch_self(void);
+
 /* ---- POSIX: which thread the title runs on --------------------------- */
 
 /* A host's main-thread event loop (src/host's recomp_host_loop_run/_quit).

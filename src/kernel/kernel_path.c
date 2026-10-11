@@ -202,6 +202,12 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 #define XBOX_PART_TABLE_OFFSET 0x800
 #define XBOX_PART_IN_USE       0x80000000u
 
+/* Everything below the first partition (LBA 0x400): the config area. XONLINE
+ * reads and writes its sectors 8 and up (Pro Evolution Soccer 5 does at boot)
+ * and finds zeros on a fresh disk; with the image ending at the table those
+ * reads were end-of-file. */
+#define XBOX_CONFIG_AREA_BYTES 0x80000
+
 static void xbox_partition_table_sector(unsigned char sector[512])
 {
     /* name[16], flags, lba_start, lba_size, reserved -- 32 bytes each */
@@ -233,7 +239,7 @@ static void xbox_partition_table_sector(unsigned char sector[512])
 /* The size of Partition<p>.img in sectors (0 for the whole-disk image, which
  * holds only the table). */
 static const unsigned long long s_part_sectors[6] = {
-    0,             /* 0: whole disk, the table only   */
+    0,             /* 0: whole disk, the config area (XBOX_CONFIG_AREA_BYTES) */
     0x00465400ull, /* 1: E: game and saves            */
     0x000FA000ull, /* 2: C: system                    */
     0x00177000ull, /* 3: X: cache                     */
@@ -305,6 +311,13 @@ static void xbox_write_partition_table(const WCHAR *path)
     off.QuadPart = XBOX_PART_TABLE_OFFSET;
     if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
         WriteFile(h, sector, sizeof(sector), &written, NULL);
+    /* Extend a shorter image to the whole config area (new bytes read as
+     * zeros); a longer one keeps what the title wrote. */
+    if (GetFileSizeEx(h, &off) && off.QuadPart < XBOX_CONFIG_AREA_BYTES) {
+        off.QuadPart = XBOX_CONFIG_AREA_BYTES;
+        if (SetFilePointerEx(h, off, NULL, FILE_BEGIN))
+            SetEndOfFile(h);
+    }
     CloseHandle(h);
 }
 
@@ -635,10 +648,14 @@ static void xbox_make_partition_images(void)
     snprintf(image, sizeof image, "%s/Partition0.img", s_save_dir);
     fd = open(image, O_RDWR | O_CREAT, 0644);
     if (fd >= 0) {
+        struct stat st;
         xbox_partition_table_sector(sector);
         if (pwrite(fd, sector, sizeof sector, XBOX_PART_TABLE_OFFSET) != (ssize_t)sizeof sector)
             fprintf(stderr, "[PATH] cannot write the partition table in %s: %s\n",
                     image, strerror(errno));
+        if (fstat(fd, &st) == 0 && st.st_size < XBOX_CONFIG_AREA_BYTES &&
+            ftruncate(fd, XBOX_CONFIG_AREA_BYTES) != 0)
+            fprintf(stderr, "[PATH] cannot size %s: %s\n", image, strerror(errno));
         close(fd);
     } else {
         fprintf(stderr, "[PATH] cannot create %s: %s\n", image, strerror(errno));

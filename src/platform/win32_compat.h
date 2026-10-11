@@ -225,6 +225,11 @@ int    w32_in_arena(const void *addr);
  * its most restrictive 4 KB page, so this, not the host page, says whether
  * an access is one the guest is allowed to make. Safe in a signal handler. */
 DWORD  w32_page_protection(const void *addr);
+/* VirtualProtect for a protection the title asked for (MmSetAddressProtect,
+ * NtProtectVirtualMemory) rather than a trap the runtime sets: on a host page
+ * it shares with a writable guest page it does not restrict the host page
+ * (posix_memory.c, arena_apply_prot). w32_page_protection still reports it. */
+BOOL   w32_guest_protect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect);
 /* An always-readable, always-writable host address for the same byte, for
  * completing an access the host page refused. NULL outside the arena's
  * placements. Safe in a signal handler. */

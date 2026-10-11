@@ -203,6 +203,9 @@ typedef struct {
 
 static uintptr_t       s_arena_lo, s_arena_hi;
 static uint8_t        *s_gprot;      /* PAGE_* per 4 KB page; 0 = nothing placed */
+/* 1 where the page's protection is one the title asked for (w32_guest_protect)
+ * rather than a trap the runtime set. See arena_apply_prot. */
+static uint8_t        *s_gsoft;
 static arena_place     s_places[ARENA_MAX_PLACES];
 static volatile int    s_nplaces;
 static pthread_mutex_t s_arena_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -232,7 +235,8 @@ void *w32_reserve_arena(size_t size, size_t align)
         munmap((void *)(lo + size), (uintptr_t)raw + span - (lo + size));
 
     s_gprot = (uint8_t *)calloc(size / GPAGE, 1);
-    if (!s_gprot) {
+    s_gsoft = (uint8_t *)calloc(size / GPAGE, 1);
+    if (!s_gprot || !s_gsoft) {
         munmap((void *)lo, size);
         return NULL;
     }
@@ -283,7 +287,19 @@ void *w32_backdoor(const void *addr)
 }
 
 /* Bring every host page in [lo, hi) to the most restrictive protection of
- * the guest pages on it. Caller holds the arena lock. */
+ * the guest pages on it. Caller holds the arena lock.
+ *
+ * Except a protection the title asked for, on a host page it shares with a
+ * writable guest page. The runtime's own traps (a device page, a watchpoint)
+ * must fault exactly, and do: they take the host page down with them, and
+ * the fault handler completes the accesses its neighbours were allowed. A
+ * title's read-only or no-access page is different -- it only catches the
+ * title's own stray writes -- and charging every access to the writable
+ * pages beside it a host fault for that is out of all proportion: Halo 2
+ * leaves read-only guard pages beside its movie buffer, and the 16 KB host
+ * page made each of the decoder's writes a signal, 125,000 of them in 40 s,
+ * on a movie that then never got a frame out. Such a page still traps when
+ * every guest page on its host page is restricted too. */
 static int arena_apply_prot(uintptr_t lo, uintptr_t hi)
 {
     uintptr_t page = w32_host_page_size();
@@ -291,13 +307,23 @@ static int arena_apply_prot(uintptr_t lo, uintptr_t hi)
     int ok = 1;
 
     for (hp = round_down(lo, page); hp < hi; hp += page) {
-        int rank = 2;
+        int rank = 2, hard = 2, soft = 2, writable = 0;
         for (uintptr_t g = hp; g < hp + page; g += GPAGE) {
-            uint8_t gp = s_gprot[(g - s_arena_lo) / GPAGE];
+            size_t i = (g - s_arena_lo) / GPAGE;
+            uint8_t gp = s_gprot[i];
             int r = gp ? prot_rank(gp) : 0;
-            if (r < rank)
-                rank = r;
+            if (r == 2)
+                writable = 1;
+            if (gp && s_gsoft[i]) {
+                if (r < soft)
+                    soft = r;
+            } else if (r < hard) {
+                hard = r;
+            }
         }
+        rank = hard;
+        if (!writable && soft < rank)
+            rank = soft;
         if (mprotect((void *)hp, page, posix_prot(win_prot(rank))) != 0)
             ok = 0;
     }
@@ -364,6 +390,7 @@ static void *arena_place_at(pm_object *obj, size_t off, uintptr_t at, size_t len
     memset(s_gprot + (lo - s_arena_lo) / GPAGE,
            (protect & 0xFF) ? (int)(protect & 0xFF) : PAGE_READWRITE,
            (hi - lo) / GPAGE);
+    memset(s_gsoft + (lo - s_arena_lo) / GPAGE, 0, (hi - lo) / GPAGE);
     __atomic_store_n(&s_nplaces, slot + 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&s_arena_lock);
     return p;
@@ -388,6 +415,7 @@ static int arena_unplace(uintptr_t at)
         mmap((void *)p->lo, p->hi - p->lo, PROT_NONE,
              MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_NORESERVE, -1, 0);
         memset(s_gprot + (p->lo - s_arena_lo) / GPAGE, 0, (p->hi - p->lo) / GPAGE);
+        memset(s_gsoft + (p->lo - s_arena_lo) / GPAGE, 0, (p->hi - p->lo) / GPAGE);
         pm_object_release(p->obj);
     }
     pthread_mutex_unlock(&s_arena_lock);
@@ -624,7 +652,21 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
     return TRUE;
 }
 
+static BOOL protect_pages(LPVOID address, SIZE_T size, DWORD newProtect,
+                          PDWORD oldProtect, int soft);
+
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+{
+    return protect_pages(address, size, newProtect, oldProtect, 0);
+}
+
+BOOL w32_guest_protect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
+{
+    return protect_pages(address, size, newProtect, oldProtect, 1);
+}
+
+static BOOL protect_pages(LPVOID address, SIZE_T size, DWORD newProtect,
+                          PDWORD oldProtect, int soft)
 {
     size_t page = w32_host_page_size();
 
@@ -652,6 +694,7 @@ BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldPro
         memset(s_gprot + (lo - s_arena_lo) / GPAGE,
                (newProtect & 0xFF) ? (int)(newProtect & 0xFF) : PAGE_NOACCESS,
                (hi - lo) / GPAGE);
+        memset(s_gsoft + (lo - s_arena_lo) / GPAGE, soft ? 1 : 0, (hi - lo) / GPAGE);
         ok = arena_apply_prot(lo, hi);
         pthread_mutex_unlock(&s_arena_lock);
         return ok ? TRUE : FALSE;

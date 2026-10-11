@@ -48,10 +48,24 @@ extern ptrdiff_t g_xbox_mem_offset;
  * The body pops its own return address and arguments, as its `ret N` does;
  * esp is put back afterwards so the thunk's pop is the only one. g_eax keeps
  * the original's result. */
+/* Inside an LTCG thunk (g_hle_ltcg_nargs set, see recomp_cpu.h) the body
+ * gets the caller's own esp and registers, not the synthetic frame the
+ * replacement reads with HLE_ARG; the context is cleared while it runs so a
+ * plain replacement reached from inside it does not take it for its own.
+ * Afterwards the synthetic frame is back, and g_eax holds the body's result. */
 #define HLE_CALL_ORIGINAL(name)                                                \
     do {                                                                       \
         uint32_t hle_esp_ = g_esp;                                             \
+        uint32_t hle_n_ = g_hle_ltcg_nargs;                                    \
+        if (hle_n_) {                                                          \
+            g_esp = g_hle_ltcg_esp;                                            \
+            g_eax = g_hle_ltcg_regs[0]; g_ecx = g_hle_ltcg_regs[1];            \
+            g_edx = g_hle_ltcg_regs[2]; g_ebx = g_hle_ltcg_regs[3];            \
+            g_esi = g_hle_ltcg_regs[4]; g_edi = g_hle_ltcg_regs[5];            \
+            g_hle_ltcg_nargs = 0;                                              \
+        }                                                                      \
         hle_original_##name();                                                 \
+        g_hle_ltcg_nargs = hle_n_;                                             \
         g_esp = hle_esp_;                                                      \
     } while (0)
 

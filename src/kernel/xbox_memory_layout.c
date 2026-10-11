@@ -2684,6 +2684,11 @@ RECOMP_TLS struct recomp_cpu g_cpu = {
     .r_fp_cc           = 0x4000u,
 };
 
+/* The caller's frame during an LTCG replacement (see recomp_cpu.h). */
+RECOMP_TLS uint32_t g_hle_ltcg_esp;
+RECOMP_TLS uint32_t g_hle_ltcg_nargs;
+RECOMP_TLS uint32_t g_hle_ltcg_regs[6];
+
 /* How far the runtime's low memory moved to clear the image; see XBOX_LOW_VA. */
 uint32_t g_xbox_low_shift = 0;
 

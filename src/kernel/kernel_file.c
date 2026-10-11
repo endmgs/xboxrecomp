@@ -38,6 +38,50 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* The folders a console keeps at the root of E: (Partition1).
+ *
+ * The dashboard creates TDATA, UDATA and CACHE on a formatted hard disk, so a
+ * title may create a file in one without creating the folder first. Here
+ * Partition1 is the game folder, which has none of them until a title makes
+ * one. Halo 2 opens E:\CACHE\LocalCache00.bin with FILE_OPEN_IF, never checks
+ * the result, and goes on to NtSetInformationFile with the -1 handle. So
+ * before a create in one of those folders, the folder is made. Only on a
+ * disposition that can create: an open of something absent still fails. */
+static void ensure_e_root_folder(const char *xbox_path, ULONG disposition)
+{
+    static const char *const prefixes[] = { "\\Device\\Harddisk0\\Partition1\\", "E:\\" };
+    static const char *const folders[] = { "TDATA", "UDATA", "CACHE" };
+    size_t i, j;
+
+    if (!xbox_path)
+        return;
+    if (disposition != XBOX_FILE_SUPERSEDE && disposition != XBOX_FILE_CREATE &&
+        disposition != XBOX_FILE_OPEN_IF && disposition != XBOX_FILE_OVERWRITE_IF)
+        return;
+    for (i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        size_t pl = strlen(prefixes[i]);
+        if (_strnicmp(xbox_path, prefixes[i], pl) != 0)
+            continue;
+        for (j = 0; j < sizeof folders / sizeof folders[0]; j++) {
+            size_t fl = strlen(folders[j]);
+            char folder[64];
+            xbox_host_char host[MAX_PATH];
+
+            if (_strnicmp(xbox_path + pl, folders[j], fl) != 0 || xbox_path[pl + fl] != '\\')
+                continue;
+            snprintf(folder, sizeof folder, "%.*s%s", (int)pl, xbox_path, folders[j]);
+            if (!xbox_translate_path(folder, host, MAX_PATH))
+                return;
+#if defined(_WIN32)
+            CreateDirectoryW(host, NULL);
+#else
+            mkdir(host, 0755);
+#endif
+            return;
+        }
+    }
+}
+
 /* Xbox volume geometry.
  *
  * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
@@ -48,9 +92,72 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * aborts CRT init before main ever runs -- the process then exits cleanly,
  * which reads as a title that did nothing rather than one that failed.
  *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check.
+ *
+ * 16 KB is the default, not a constant. A volume the title formatted itself
+ * says what it is: XAPI's utility-drive mount formats the cache partition with
+ * the cluster size the title asked for -- Halo 2 asks for 64 KB -- and then
+ * requires FileFsSizeInformation to report exactly that, or it calls the
+ * volume unrecognized (0xC000014F), formats again, and boots to the dashboard
+ * with XLD_ERROR_INVALID_HARD_DISK. So a handle on a partition image whose
+ * first sector is a FATX superblock reports that superblock's sectors per
+ * cluster (offset 8), and its size from the image (fatx_sectors_per_cluster on
+ * Win32, the POSIX query below). */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
+/* A FATX superblock's sectors per cluster, when `head` (the volume's first 12
+ * bytes) is one: magic "FATX", volume id, sectors per cluster. 0 otherwise, or
+ * for a value no FATX volume has (not a power of two, or above 128 KB). */
+static unsigned fatx_superblock_spc(const unsigned char head[12])
+{
+    unsigned spc;
+
+    if (memcmp(head, "FATX", 4) != 0)
+        return 0;
+    spc = (unsigned)head[8] | ((unsigned)head[9] << 8) |
+          ((unsigned)head[10] << 16) | ((unsigned)head[11] << 24);
+    if (spc == 0 || spc > 256 || (spc & (spc - 1)) != 0)
+        return 0;
+    return spc;
+}
+
+/* A partition image the title has formatted: its first sector is a FATX
+ * superblock. A directory open of such a device opens the image itself (so
+ * FileFsSizeInformation can read the geometry the title chose) instead of the
+ * folder holding it; an image nobody formatted keeps the folder, which is what
+ * Half-Life 2's free-space probe of Partition0 is given. */
+#if defined(_WIN32)
+static int device_image_is_fatx(const WCHAR *path)
+{
+    unsigned char head[12];
+    DWORD got = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok = 0;
+
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    if (ReadFile(h, head, sizeof head, &got, NULL) && got == sizeof head)
+        ok = fatx_superblock_spc(head) != 0;
+    CloseHandle(h);
+    return ok;
+}
+#else
+static int device_image_is_fatx(const char *path)
+{
+    unsigned char head[12];
+    int fd = open(path, O_RDONLY);
+    int ok = 0;
+
+    if (fd < 0)
+        return 0;
+    if (pread(fd, head, sizeof head, 0) == (ssize_t)sizeof head)
+        ok = fatx_superblock_spc(head) != 0;
+    close(fd);
+    return ok;
+}
+#endif
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -193,6 +300,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    ensure_e_root_folder(get_xbox_path(ObjectAttributes), CreateDisposition);
 
     /* A partition device opened as a directory.
      *
@@ -207,6 +315,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * gives a handle that is valid for exactly what the caller is going to do
      * with it, which is NtQueryVolumeInformationFile. */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
+        !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY) &&
+        device_image_is_fatx(win_path)) {
+        CreateOptions &= ~XBOX_FILE_DIRECTORY_FILE;   /* the formatted volume itself */
+    } else if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
@@ -1055,10 +1168,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    ensure_e_root_folder(xbox_path, CreateDisposition);
 
     /* A partition device opened as a directory (a free-space query): the
      * directory that holds its image stands in for the volume. */
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
+        stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode) &&
+        device_image_is_fatx(host_path)) {
+        CreateOptions &= ~XBOX_FILE_DIRECTORY_FILE;   /* the formatted volume itself */
+    } else if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         stat(host_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
         char *slash = strrchr(host_path, '/');
         if (slash && slash != host_path) {
@@ -1309,6 +1427,22 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
+        case XboxFileAllocationInformation: {
+            /* Reserve space for a file, as the Win32 half does (it says why:
+             * Halo's save path). Halo 2 sizes its save and cache files this
+             * way and got STATUS_NOT_IMPLEMENTED here. Same semantics as NT
+             * FileAllocationInfo: an allocation below the end of file cuts the
+             * file to it; one above leaves the end of file where it is, and a
+             * POSIX file needs no reservation to grow into it. */
+            PXBOX_FILE_END_OF_FILE_INFORMATION info =
+                (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
+            struct stat st;
+            if (fstat(fd, &st) == 0 && (off_t)info->EndOfFile.QuadPart < st.st_size &&
+                    ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             /* POSIX: unlinking an open file removes it on last close -- this
@@ -1349,12 +1483,25 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
+            struct stat st;
+            unsigned char head[12];
+            unsigned spc = 0;
             int fd = w32_handle_fd(FileHandle);
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
+            if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                    pread(fd, head, sizeof head, 0) == (ssize_t)sizeof head)
+                spc = fatx_superblock_spc(head);
+            if (spc) {
+                /* A partition image the title formatted itself. */
+                ULONGLONG cs = (ULONGLONG)XBOX_BYTES_PER_SECTOR * spc;
+                info->SectorsPerAllocationUnit = spc;
+                info->TotalAllocationUnits.QuadPart = (ULONGLONG)st.st_size / cs;
+                info->AvailableAllocationUnits.QuadPart =
+                    info->TotalAllocationUnits.QuadPart ? info->TotalAllocationUnits.QuadPart - 1 : 0;
+            } else if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;

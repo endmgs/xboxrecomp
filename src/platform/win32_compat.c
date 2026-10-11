@@ -373,16 +373,26 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     return (HANDLE)o;
 }
 
+/* Not an object: NULL, INVALID_HANDLE_VALUE and the pseudo handles are
+ * values, not pointers. A title that passes one on (Halo 2 calls
+ * NtSetInformationFile on -1 when an open it did not check has failed) gets
+ * "no such file" rather than a host fault on reading through it. */
+static int w32_handle_is_value(HANDLE h)
+{
+    return !h || h == INVALID_HANDLE_VALUE || h == PSEUDO_CURRENT_THREAD ||
+           h == PSEUDO_CURRENT_PROCESS;
+}
+
 int w32_handle_fd(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->fd : -1;
+    return (!w32_handle_is_value(h) && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
+    return (!w32_handle_is_value(h) && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
 BOOL CloseHandle(HANDLE h)

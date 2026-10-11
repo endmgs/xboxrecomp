@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "nv2a_vsh.h"
 
@@ -319,8 +320,38 @@ static void test_inputs_read_ignores_unread_sources(void)
     CHECK(g_prog.inputs_read == 0, "a MOV from a constant reads no input");
 }
 
+/* NV2A's EXP and LOG are D3D's expp and logp: four components, not one
+ * splatted. Halo 2's particle program reads expp(x).y as frac(x). */
+static void test_exp_log_are_partial_precision(void)
+{
+    uint32_t w[4];
+    float inputs[NV2A_VS_MAX_INPUTS][4];
+    float consts[1][4] = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+    NV2AVshState st;
+    const float *d1;
+
+    memset(inputs, 0, sizeof inputs);
+    one_insn(w, 3);                      /* MUL R2, R1, c[0] + MOV oD1, v4 */
+    set_field(w, F_ILU, 3, NV2A_VSH_ILU_EXP);
+    nv2a_vsh_parse(w, 1, &g_prog);
+    inputs[4][0] = 2.75f;
+    nv2a_vsh_execute(&g_prog, (ConstRows)inputs, (ConstRows)consts, 1, &st);
+    d1 = st.out[NV2A_VSH_OUT_D1];
+    CHECK(d1[0] == 4.0f && d1[1] == 0.75f && fabsf(d1[2] - 6.7271713f) < 1e-4f
+          && d1[3] == 1.0f, "EXP gives (2^floor, frac, 2^x, 1)");
+
+    set_field(w, F_ILU, 3, NV2A_VSH_ILU_LOG);
+    nv2a_vsh_parse(w, 1, &g_prog);
+    inputs[4][0] = -10.0f;
+    nv2a_vsh_execute(&g_prog, (ConstRows)inputs, (ConstRows)consts, 1, &st);
+    d1 = st.out[NV2A_VSH_OUT_D1];
+    CHECK(d1[0] == 3.0f && d1[1] == 1.25f && fabsf(d1[2] - 3.3219281f) < 1e-4f
+          && d1[3] == 1.0f, "LOG gives (exponent, mantissa, log2|x|, 1)");
+}
+
 int main(void)
 {
+    test_exp_log_are_partial_precision();
     test_frontend_decode();
     test_frontend_execute();
     test_paired_ilu_writes_r1();

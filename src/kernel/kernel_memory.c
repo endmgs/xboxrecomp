@@ -188,7 +188,11 @@ ULONG __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress)
 VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, ULONG NewProtect)
 {
     DWORD old_protect;
+#ifdef _WIN32
     VirtualProtect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
+#else
+    w32_guest_protect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
+#endif
     XBOX_TRACE(XBOX_LOG_MEM, "MmSetAddressProtect(%p, %u, 0x%X)", BaseAddress, NumberOfBytes, NewProtect);
 }
 

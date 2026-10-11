@@ -86,6 +86,40 @@ def test_the_jumps_own_displacement_is_not_an_arm():
     assert "switch: 3 entries" in c, c
 
 
+def test_a_far_code_address_below_the_table_ends_the_backward_scan():
+    """
+    PES5's memmove: `neg ecx; jmp [ecx*4 + END]` over arms below END, and
+    the word below the arms reads as a code address far from the dispatch.
+
+    0x00  F7 D9                neg ecx
+    0x02  FF 24 8D <disp32>    jmp [ecx*4 + BASE+0x1C]    ecx is -3..0
+    0x09  8B 8B 8B             filler, not a jmp opcode
+    0x0C  <far>                a code address 0x5000 away, not an arm
+    0x10  table: arms 0x20, 0x21, 0x22, 0x23                (to 0x20)
+    0x20  C3 C3 C3 C3 + padding to a far "function" at 0x5000
+
+    Taking <far> as entry 0 dropped the switch, because
+    _analyze_switch_table ends it at the first arm outside the function.
+    """
+    far = BASE + 0x5000
+    disp = BASE + 0x1C
+    code = bytes.fromhex("F7D9FF248D") + struct.pack("<I", disp)  # 0x00..0x09
+    code += bytes.fromhex("8B8B8B")                               # 0x09..0x0C
+    code += struct.pack("<I", far)                                # 0x0C..0x10
+    arms = [BASE + 0x20, BASE + 0x21, BASE + 0x22, BASE + 0x23]
+    # Index 0 names the last arm; the forward word after it is 0xC3C3C3C3.
+    code += b"".join(struct.pack("<I", a) for a in arms)          # 0x10..0x20
+    code += bytes.fromhex("C3C3C3C3")                             # 0x20..0x24
+    code += b"\xCC" * (0x5000 - len(code)) + b"\xC3"              # far is code
+    image = _setup(code)
+    db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + 0x24,
+                 "_addr": BASE, "size": 0x24}}
+    c = FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+    assert "switch:" in c, c
+    for arm in arms:
+        assert f"if (_jt == 0x{arm:08X}u)" in c, (hex(arm), c)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

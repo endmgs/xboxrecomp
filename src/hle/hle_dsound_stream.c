@@ -59,6 +59,7 @@ typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 long __stdcall xbox_NtSetEvent(void *EventHandle, long *PreviousState);   /* NTSTATUS */
+int xbox_bridge_set_guest_event(uint32_t va);                         /* kernel_bridge.c */
 void *xbox_bridge_resolve_handle(uint32_t token);                          /* kernel_bridge.c */
 void hle_dsound_service_start(void);                                       /* hle_dsound.c */
 
@@ -347,7 +348,13 @@ static void complete(Stream *s, const Packet *p, uint32_t status, uint32_t size)
          * every SetEvent failed (ERROR_INVALID_HANDLE, one kernel-log line per
          * packet in Hunter: The Reckoning) and the title only saw packets
          * complete when its own wait timed out. */
-        void *event = xbox_bridge_resolve_handle(p->context);
+        void *event;
+        /* Or a KEVENT in the title's memory, set in place: Halo 2 passes one
+         * in contiguous memory (0x805C1760), and as a handle it reached the
+         * host's SetEvent, which faulted on POSIX. */
+        if (xbox_bridge_set_guest_event(p->context))
+            return;
+        event = xbox_bridge_resolve_handle(p->context);
         if (event)
             xbox_NtSetEvent(event, NULL);
     }

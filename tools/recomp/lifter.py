@@ -2067,7 +2067,21 @@ class Lifter:
         if len(ops) < 2 or ops[1].type != "mem":
             return [f"/* lea: unexpected operands */"]
         addr_expr = _fmt_mem(ops[1])
-        return [_fmt_operand_write(ops[0], addr_expr)]
+        out = [_fmt_operand_write(ops[0], addr_expr)]
+        # `lea ebp, [esp - N]` is a frame too: MSVC's biased frame pointer,
+        # `push ebp; lea ebp, [esp-0x70]; sub esp, 0x274`, which reaches more
+        # locals with 8-bit displacements. Publish it as `mov ebp, esp` does
+        # (see _lift_mov). Unpublished, a guest setjmp called from such a
+        # function saved its caller's frame into the jmp_buf, and the longjmp
+        # back restored that one: Pro Evolution Soccer 5's libjpeg decoder
+        # (sub_004F5929) left through `add ebp,0x70; leave` with esp 0x90 too
+        # high, the next decoder's frame landed on its caller's, and the
+        # caller's pSrcInfo argument was overwritten with a gamma ramp.
+        if (ops[0].type == "reg" and ops[0].reg == "ebp" and
+                ops[1].mem_base == "esp" and not ops[1].mem_index):
+            out.append("g_ebp = ebp; /* publish frame for frameless callees */")
+            out.append("g_seh_ebp = ebp;")
+        return out
 
     def _lift_xchg(self, insn, ops):
         if len(ops) < 2:
@@ -2905,14 +2919,35 @@ class Lifter:
         if offset is None:
             return []
         targets = []
-        for i in range(max_entries):
-            o = offset + i * 4
+
+        def word(k):
+            o = offset + k * 4
             if o + 4 > len(self.xbe_data):
+                return None
+            return struct.unpack_from('<I', self.xbe_data, o)[0]
+
+        i = 0
+        while i < max_entries:
+            val = word(i)
+            if val is None:
                 break
-            val = struct.unpack_from('<I', self.xbe_data, o)[0]
+            if val == 0 and targets:
+                # A hole -- a case value that cannot happen -- with real
+                # entries after it (Halo 2's sub_00216A50: four cases, two
+                # zeros, three more). Same rule as the disassembler's
+                # resync_jump_tables: up to eight zeros, then a code address.
+                run = 1
+                while run <= 8 and word(i + run) == 0:
+                    run += 1
+                nxt = word(i + run) if run <= 8 else None
+                if nxt is not None and is_code_address(nxt):
+                    i += run
+                    continue
+                break
             if not is_code_address(val):
                 break
             targets.append(val)
+            i += 1
 
         # The displacement names index 0, which is not always the first entry.
         #
@@ -2957,6 +2992,23 @@ class Lifter:
                     and (self.xbe_data[offset - 5] & 0xC7) == 0x85):
                 floor = offset - 4       # the disp belongs to the jump
 
+            # A backward entry must also point near the dispatch, as a case
+            # label does -- the rule DisasmEngine.resync_jump_tables already
+            # applies. "Is a code address" alone gets weaker as the image gets
+            # bigger. Pro Evolution Soccer 5's memmove dispatches through
+            # `neg ecx; jmp [ecx*4 + 0x349DF8]` over eight arms at
+            # 0x349DDC-0x349DF8, and the word below them, 00 8D 49 00 (the
+            # previous jump's last displacement byte and a `lea ecx,[ecx]`),
+            # reads as 0x00498D00 -- an overlay's code in a 15 MB image. It
+            # became entry 0, _analyze_switch_table stops at the first arm
+            # outside the function, so the whole switch was dropped, and every
+            # overlapping copy left memmove through an unresolved jump with
+            # esi, edi and esp wrong. Within 4 KB of the dispatch, or of the
+            # span the forward entries cover.
+            cluster = targets + [table_va]
+            cluster_lo = min(cluster) - 0x1000
+            cluster_hi = max(cluster) + 0x1000
+
             back = []
             for i in range(1, max_entries + 1):
                 o = offset - i * 4
@@ -2964,6 +3016,8 @@ class Lifter:
                     break
                 val = struct.unpack_from('<I', self.xbe_data, o)[0]
                 if not is_code_address(val):
+                    break
+                if not (cluster_lo <= val <= cluster_hi):
                     break
                 # The value backstop is for the jump's own displacement, so it
                 # only fires when the word IS one: preceded by FF 24 <SIB>.

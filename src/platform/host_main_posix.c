@@ -242,6 +242,28 @@ static void *body_thread(void *arg)
     return NULL;
 }
 
+/* The arguments the process started with, for host_relaunch_self. */
+static char **g_start_argv;
+
+int host_relaunch_self(void)
+{
+    char exe[PATH_MAX];
+    char *fallback[2];
+
+    if (!host_exe_path(exe, sizeof exe))
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    if (g_start_argv && g_start_argv[0]) {
+        execv(exe, g_start_argv);
+    } else {
+        fallback[0] = exe;
+        fallback[1] = NULL;
+        execv(exe, fallback);
+    }
+    return 0;                       /* execv returned: it failed */
+}
+
 int host_main_posix(int argc, char **argv, int (*body)(int argc, char **argv),
                     const host_loop *loop)
 {
@@ -256,6 +278,7 @@ int host_main_posix(int argc, char **argv, int (*body)(int argc, char **argv),
      * only reserved, not committed. */
     if (stack_mb <= 0)
         stack_mb = 64;
+    g_start_argv = argv;
     s.argc = argc;
     s.argv = argv;
     s.body = body;

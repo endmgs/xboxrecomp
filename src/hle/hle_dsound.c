@@ -1690,6 +1690,62 @@ HLE_EXPORT(IDirectSoundBuffer_SetBufferData)
     HLE_RETURN(RECOMP_DSOUND_OK);
 }
 
+/* HRESULT IDirectSoundBuffer_Lock(this, DWORD offset, DWORD bytes,
+ *     LPVOID *ptr1, LPDWORD bytes1, LPVOID *ptr2, LPDWORD bytes2, DWORD flags)
+ *
+ * The game's own Lock reads the buffer's data pointer from the voice object
+ * SetBufferData's body fills in -- and the replaced SetBufferData above writes
+ * only the settings the model plays from. Halo 2's Bink plays its movie sound
+ * through a buffer it hands a block with SetBufferData and then Locks: the
+ * game's Lock found a null data pointer and returned offsets from address
+ * zero, and Bink's clear of its 106,496-byte sound buffer landed on the
+ * game's own code (a jump table at 0x00026868), which hung the title after
+ * its intro. So Lock answers from the same settings the model plays: the data
+ * and size, the region wrapped at the end of the buffer the way DirectSound
+ * returns it. DSBLOCK_ENTIREBUFFER (2) takes the whole buffer; for
+ * DSBLOCK_FROMWRITECURSOR (1) the model's play cursor stands in for the write
+ * cursor. Only for a buffer in that layout (settings_in_layout). */
+HLE_ORIGINAL(IDirectSoundBuffer_Lock);
+HLE_EXPORT(IDirectSoundBuffer_Lock)
+{
+    uint32_t iface = HLE_ARG(0), offset = HLE_ARG(1), bytes = HLE_ARG(2);
+    uint32_t p1 = HLE_ARG(3), n1 = HLE_ARG(4), p2 = HLE_ARG(5), n2 = HLE_ARG(6);
+    uint32_t flags = HLE_ARG(7), data, size, first;
+    static unsigned said;
+
+    if (!settings_in_layout(iface) || !(data = setting(iface, SET_DATA)) ||
+        !(size = setting(iface, SET_SIZE))) {
+        original_body(hle_original_IDirectSoundBuffer_Lock, "IDirectSoundBuffer_Lock");
+        return;
+    }
+    if (flags & 2u) {                       /* DSBLOCK_ENTIREBUFFER */
+        offset = 0u;
+        bytes = size;
+    } else if (flags & 1u) {                /* DSBLOCK_FROMWRITECURSOR */
+        Buffer *b;
+        uint64_t now = now_ms();
+        lock();
+        b = model_for(iface, now);
+        offset = b ? recomp_dsound_buffer_cursor(&b->model, now) : 0u;
+        unlock();
+    }
+    if (offset >= size)
+        offset %= size;
+    if (bytes > size)
+        bytes = size;
+    first = bytes <= size - offset ? bytes : size - offset;
+    if (said < 4) {
+        said++;
+        fprintf(stderr, "[DSOUND] Lock buffer=%08X offset %u, %u bytes (flags 0x%X) -> "
+                        "0x%08X\n", iface, offset, bytes, flags, data + offset);
+    }
+    if (p1) HLE_MEM32(p1) = data + offset;
+    if (n1) HLE_MEM32(n1) = first;
+    if (p2) HLE_MEM32(p2) = bytes > first ? data : 0u;
+    if (n2) HLE_MEM32(n2) = bytes - first;
+    HLE_RETURN(RECOMP_DSOUND_OK);
+}
+
 /* void DirectSoundDoWork(void) -- the title's regular audio tick. The game's
  * own version services the emulated chip's deferred commands, which the
  * replaced buffers no longer need; here it feeds the host output. */

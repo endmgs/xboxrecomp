@@ -79,6 +79,23 @@ struct recomp_cpu {
 
 extern RECOMP_TLS struct recomp_cpu g_cpu;
 
+/* The caller's own frame while an LTCG replacement runs.
+ *
+ * An LTCG build passes some arguments in registers, so the generated thunk
+ * (RECOMP_HLE_LTCG_CALL in recomp_types.h) gives the replacement an ordinary
+ * argument frame of its own. A replacement that also runs the title's body
+ * (HLE_CALL_ORIGINAL) must hand that body the caller's real frame and
+ * registers instead, or the body reads its stack arguments from the
+ * synthetic frame -- Halo 2's Direct3D_CreateDevice read its BehaviorFlags
+ * as the presentation parameters pointer and failed. The thunk records them
+ * here for the length of the call: esp as the thunk found it, the argument
+ * count of the synthetic frame (0 outside an LTCG thunk), and eax, ecx, edx,
+ * ebx, esi, edi. Separate from g_cpu so that a title lifted before this
+ * existed keeps the same register layout. */
+extern RECOMP_TLS uint32_t g_hle_ltcg_esp;
+extern RECOMP_TLS uint32_t g_hle_ltcg_nargs;
+extern RECOMP_TLS uint32_t g_hle_ltcg_regs[6];
+
 #define g_eax                   (g_cpu.r_eax)
 #define g_ecx                   (g_cpu.r_ecx)
 #define g_edx                   (g_cpu.r_edx)

@@ -48,6 +48,15 @@ def _detector(table_words):
     code[0x100:0x114] = b"\x89\xc0" * 10            # falls through into 0x114
     code[0x114:0x114 + len(LONG)] = LONG
     code[0x301:0x301 + len(LONG)] = LONG
+    # A function ending in `ret 0Ch` exactly on a 16-byte boundary, and the
+    # next one starting right there with no padding (Halo 2's tag accessors).
+    code[0x200:0x20D] = b"\x89\xc0" * 6 + b"\x90"
+    code[0x20D:0x210] = b"\xc2\x0c\x00"           # ret 0Ch, ends at 0x210
+    code[0x210:0x218] = b"\x8b\x44\x24\x04\xc2\x0c\x00\x90"  # mov eax,[esp+4]; ret 0Ch
+    # The same body after a mov that falls into it: not a boundary.
+    code[0x220:0x22E] = b"\x89\xc0" * 7
+    code[0x22E:0x230] = b"\x89\xc0"
+    code[0x230:0x237] = b"\x8b\x44\x24\x04\xc2\x0c\x00"
     text = _Section(TEXT, bytes(code))
     text.data = bytes(code)
 
@@ -101,6 +110,26 @@ def test_a_lone_word_at_an_unaligned_target_is_not():
     det, text = _detector([LONELY, 0])
     det._pass_data_ptr_targets([text])
     assert LONELY not in det._alias_entries, det._alias_entries
+
+
+RET_ADJ = TEXT + 0x210
+FALL_ADJ = TEXT + 0x230
+
+
+def test_a_lone_word_right_after_a_ret_is_found():
+    # Halo 2's 0x002AC4B0: 16-aligned, straight after the previous function's
+    # `ret 0Ch`, named by one word in a record of small numbers.
+    det, text = _detector([4, RET_ADJ, 0])
+    det._pass_data_ptr_targets([text])
+    assert RET_ADJ in det._alias_entries, det._alias_entries
+
+
+def test_a_lone_word_after_a_fall_through_is_not():
+    # The same body, 16-aligned, but code runs into it: the middle of
+    # something, whatever the word says.
+    det, text = _detector([4, FALL_ADJ, 0])
+    det._pass_data_ptr_targets([text])
+    assert FALL_ADJ not in det._alias_entries, det._alias_entries
 
 
 if __name__ == "__main__":

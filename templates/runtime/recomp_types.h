@@ -1039,14 +1039,25 @@ extern volatile uint64_t g_icall_guard_misses;
         uint32_t a[RECOMP_HLE_MAX_ARGS]; \
         uint32_t _hle_i; \
         void (*_hle_fn)(void) = (fn); \
+        uint32_t _hle_prev_esp = g_hle_ltcg_esp, _hle_prev_n = g_hle_ltcg_nargs; \
+        uint32_t _hle_prev_regs[6]; \
+        memcpy(_hle_prev_regs, g_hle_ltcg_regs, sizeof _hle_prev_regs); \
+        g_hle_ltcg_regs[0] = g_eax; g_hle_ltcg_regs[1] = g_ecx; \
+        g_hle_ltcg_regs[2] = g_edx; g_hle_ltcg_regs[3] = g_ebx; \
+        g_hle_ltcg_regs[4] = g_esi; g_hle_ltcg_regs[5] = g_edi; \
         (void)_hle_stack;
 
 #define RECOMP_HLE_LTCG_END \
         MEM32(_hle_frame) = _hle_ret; \
         for (_hle_i = 0; _hle_i < _hle_n && _hle_i < RECOMP_HLE_MAX_ARGS; _hle_i++) \
             MEM32(_hle_frame + 4u + 4u * _hle_i) = a[_hle_i]; \
+        g_hle_ltcg_esp = _hle_save; \
+        g_hle_ltcg_nargs = _hle_n ? _hle_n : 1u; \
         g_esp = _hle_frame; \
         _hle_fn(); \
+        g_hle_ltcg_esp = _hle_prev_esp; \
+        g_hle_ltcg_nargs = _hle_prev_n; \
+        memcpy(g_hle_ltcg_regs, _hle_prev_regs, sizeof _hle_prev_regs); \
         g_esp = _hle_save + _hle_pop; \
     }
 

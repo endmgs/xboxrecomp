@@ -827,6 +827,29 @@ static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
             break;
         }
     }
+    /* RECOMP_HLE_D3D8_TEX_PROBE=<w>x<h>: every lookup of a texture that size,
+     * with where its texels are and whether any are non-zero. */
+    {
+        static int pw = -1, ph;
+        if (pw < 0) {
+            const char *v = getenv("RECOMP_HLE_D3D8_TEX_PROBE");
+            pw = 0;
+            if (v) sscanf(v, "%dx%d", &pw, &ph);
+        }
+        if (pw > 0 && read_layout(va, &t) && (int)t.width == pw && (int)t.height == ph) {
+            static unsigned long said;
+            const uint8_t *px = (const uint8_t *)HLE_PTR(CONTIG_BASE + t.phys);
+            uint32_t k, nz = 0;
+            for (k = 0; k < t.bytes; k++)
+                nz += px[k] != 0;
+            if (said++ < 40)
+                fprintf(stderr, "[TEX-PROBE] swap %lu va 0x%08X data 0x%08X phys 0x%08X "
+                        "fmt 0x%02X %s pitch %u: %u of %u bytes non-zero, sum 0x%08X%s%s\n",
+                        now, va, data, t.phys, t.fmt, t.linear ? "linear" : "swizzled",
+                        t.guest_pitch, nz, t.bytes, level0_checksum(&t),
+                        e ? " (cached)" : " (new)", e && e->rendered ? " rendered" : "");
+        }
+    }
     if (e) {
         e->used_swap = now;
         /* RECOMP_HLE_D3D8_TEX_EVERY_BIND=1: check the texels at every bind,
@@ -1707,6 +1730,7 @@ HLE_EXPORT(D3DDevice_SetTexture)
  * would need its object's Size, so it is counted and the stage left as it
  * was. Cxbx-Reloaded replaces it too (EMUPATCH(D3DDevice_SwitchTexture)). */
 HLE_ORIGINAL(D3DDevice_SwitchTexture);
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format);
 
 HLE_EXPORT(D3DDevice_SwitchTexture)
 {
@@ -1722,13 +1746,24 @@ HLE_EXPORT(D3DDevice_SwitchTexture)
         return;
     }
     HLE_CALL_ORIGINAL(D3DDevice_SwitchTexture);
+    if (hle_d3d8_shadow_device() && (method & 0x1FFCu) >= 0x1B00u && (method & 0x1FFCu) < 0x1C00u)
+        hle_d3d8_texture_by_state(((method & 0x1FFCu) - 0x1B00u) / 0x40u, data, format);
+}
+
+/* A stage's texture named by its offset and format alone, as SwitchTexture
+ * and the push buffer name it (SET_TEXTURE_OFFSET / SET_TEXTURE_FORMAT, 0x1B00
+ * and 0x1B04 + 64 per stage): found among the textures already mirrored by its
+ * Data and Format and bound through that object as SetTexture would. Halo 2's
+ * LTCG build writes those methods inline for every quad of its movie, flipping
+ * between two frame textures it bound once each through SetTexture. */
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
+{
     {
-        uint32_t m = method & 0x1FFCu, stage, va = 0;
+        uint32_t va = 0;
         int i;
 
-        if (!hle_d3d8_shadow_device() || m < 0x1B00u || m >= 0x1C00u)
+        if (!hle_d3d8_shadow_device() || stage >= 4u)
             return;
-        stage = (m - 0x1B00u) / 0x40u;
         for (i = 0; i < g_texture_count; i++) {
             texture_entry *c = &g_textures[i];
             if (c->host && c->va && !is_synth(c->va) && c->data == data &&

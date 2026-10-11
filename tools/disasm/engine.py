@@ -279,7 +279,10 @@ class DisasmEngine:
         """
         if dispatch_end is None:
             return False
-        byte_tbl = tbl + entries * 4
+        # The byte table follows the dword table, at most three bytes of
+        # padding later: Halo 2's sub_0022C330 has two entries at 0x0022C370
+        # and its byte table at 0x0022C37B.
+        byte_lo = tbl + entries * 4
         window = self.image.read_bytes_at_va(dispatch_end - 32, 32)
         if not window or len(window) < 32:
             return False
@@ -289,7 +292,8 @@ class DisasmEngine:
             modrm = window[i + 2]
             if (modrm >> 6) != 2 or (modrm & 7) == 4:
                 continue
-            if int.from_bytes(window[i + 3:i + 7], "little") != byte_tbl:
+            byte_tbl = int.from_bytes(window[i + 3:i + 7], "little")
+            if not (byte_lo <= byte_tbl <= byte_lo + 3):
                 continue
             first = self.image.read_bytes_at_va(byte_tbl, 1)
             return bool(first) and first[0] < entries
@@ -367,6 +371,24 @@ class DisasmEngine:
             entries = 0
             while entries < max_entries:
                 target = self.image.read_u32_at_va(tbl + entries * 4)
+                if target == 0 and entries > 0:
+                    # A hole: a case value that cannot happen, left as 0
+                    # (Halo 2's sub_00216A50 has cases 1-4, two zeros, then
+                    # 7-9 -- stopping at the first zero lost the last three,
+                    # and their arms fell outside the function; its
+                    # sub_000336F0 has a run of five in a 43-entry table).
+                    # Step over at most eight zeros, and only when a real
+                    # entry follows; trailing zeros are not part of the table.
+                    run = 1
+                    while run <= 8:
+                        nxt = self.image.read_u32_at_va(tbl + (entries + run) * 4)
+                        if nxt != 0:
+                            break
+                        run += 1
+                    if run <= 8 and nxt is not None and lo <= nxt < hi:
+                        entries += run
+                        continue
+                    break
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
@@ -526,8 +548,9 @@ class DisasmEngine:
         end = self.jump_tables.get(start)
         if end is None:
             return []
-        return [self.image.read_u32_at_va(a) or 0
-                for a in range(start, end, 4)]
+        # Holes (zero entries, see resync_jump_tables) are not code pointers.
+        return [t for t in (self.image.read_u32_at_va(a) or 0
+                            for a in range(start, end, 4)) if t]
 
     def decode_at(self, addr: int, max_insns: int = 4096) -> int:
         """

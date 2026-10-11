@@ -1012,7 +1012,13 @@ void hle_d3d8_shadow_apply_states(IDirect3DDevice8 *dev)
  * read out of TimeSplitters 2's .rdata at 0x00222100. */
 HLE_ORIGINAL(D3DDevice_SetRenderState_Simple);
 
-HLE_EXPORT(D3DDevice_SetRenderState_Simple)
+/* Store a simple state's value in the render-state array, by its method. 1 when
+ * the method is one of them. Shared by the replacement below and the
+ * push-buffer walk (hle_d3d8_vertex.c), which sees the same writes when the
+ * title has SetRenderState_Simple inlined -- Halo 2's LTCG build does, at
+ * every use, so nothing replaced ever saw its depth, blend, colour-mask and
+ * stencil changes, and its depth-only and stencil passes drew solid colour. */
+int hle_d3d8_state_store_simple(uint32_t method, uint32_t value)
 {
     static const struct { uint16_t method; uint8_t state; } map[] = {
         { 0x0354, 57 },  /* ZFUNC              NV097_SET_DEPTH_FUNC */
@@ -1041,24 +1047,31 @@ HLE_EXPORT(D3DDevice_SetRenderState_Simple)
         { 0x0334, 80 },  /* WIREFRAMEOFFSETENABLE */
         { 0x0338, 81 },  /* SOLIDOFFSETENABLE */
     };
-    uint32_t method = g_ecx & 0x1FFCu, value = g_edx;
     size_t i;
     /* RECOMP_HLE_D3D8_RS_SIMPLE=0 leaves the array stale, as before this
      * replacement, to tell a wrong state apart from a wrong draw. */
     static int store = -1;
 
-    if (hle_original_D3DDevice_SetRenderState_Simple)
-        HLE_CALL_ORIGINAL(D3DDevice_SetRenderState_Simple);
     if (store < 0) {
         const char *e = getenv("RECOMP_HLE_D3D8_RS_SIMPLE");
         store = !(e && *e == '0');
     }
-    if (!hle_var_D3D_g_RenderState || !store)
-        return;
+    method &= 0x1FFCu;
     for (i = 0; i < sizeof map / sizeof map[0]; i++) {
         if (map[i].method == method) {
-            HLE_MEM32(hle_var_D3D_g_RenderState + 4u * map[i].state) = value;
-            return;
+            if (hle_var_D3D_g_RenderState && store)
+                HLE_MEM32(hle_var_D3D_g_RenderState + 4u * map[i].state) = value;
+            return 1;
         }
     }
+    return 0;
+}
+
+HLE_EXPORT(D3DDevice_SetRenderState_Simple)
+{
+    uint32_t method = g_ecx & 0x1FFCu, value = g_edx;
+
+    if (hle_original_D3DDevice_SetRenderState_Simple)
+        HLE_CALL_ORIGINAL(D3DDevice_SetRenderState_Simple);
+    (void)hle_d3d8_state_store_simple(method, value);
 }
