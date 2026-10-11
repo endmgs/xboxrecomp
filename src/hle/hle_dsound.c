@@ -60,6 +60,7 @@ void hle_dsound_stream_tick(uint64_t now);   /* hle_dsound_stream.c */
 int xbox_EnvSwitch(const char *name, int default_on);
 long __stdcall xbox_NtSetEvent(void *EventHandle, long *PreviousState);   /* NTSTATUS */
 void *xbox_bridge_resolve_handle(uint32_t token);                          /* kernel_bridge.c */
+int xbox_bridge_set_guest_event(uint32_t va);                             /* kernel_bridge.c */
 
 enum {
     SET_FORMAT     = 0x0Cu,   /* tag | channels << 16 | bits << 24 */
@@ -439,9 +440,15 @@ static Notify *notify_find(uint32_t iface)
     return NULL;
 }
 
+/* The title's event: a handle, or a KEVENT in its own memory, set in place
+ * (as hle_dsound_stream.c completes packets -- Halo 2 passes KEVENTs there,
+ * and one taken for a handle faulted in the host's SetEvent on POSIX). */
 static void notify_signal(uint32_t handle)
 {
-    void *event = handle ? xbox_bridge_resolve_handle(handle) : NULL;
+    void *event;
+    if (!handle || xbox_bridge_set_guest_event(handle))
+        return;
+    event = xbox_bridge_resolve_handle(handle);
     if (event)
         xbox_NtSetEvent(event, NULL);
 }
