@@ -301,11 +301,15 @@ void applyLevels(IXAudio2Voice *v, uint32_t channels, const RecompAudioMix &mix)
                 foldSpeaker(matrix, channels, c, s, mix.levels[c][s]);
     v->SetOutputMatrix(dryTarget(), channels, master_channels, matrix);
     if (reverb_voice) {
+        /* Channel to input; a mono voice (the console's I3DL2 bin is mono)
+           into both at -3 dB, which measured within 1.2 dB of a mono-input
+           reverb's level. */
         float send[2 * 2] = {};
         for (uint32_t c = 0; c < channels && c < 2; ++c)
             for (uint32_t i = 0; i < reverb_inputs; ++i)
                 if (reverb_inputs == 1 || i == c || channels == 1)
-                    send[i * channels + c] = mix.reverb[c];
+                    send[i * channels + c] = mix.reverb[c] *
+                        (channels == 1 && reverb_inputs == 2 ? 0.70710678f : 1.0f);
         v->SetOutputMatrix(reverb_voice, channels, reverb_inputs, send);
     }
 }
@@ -511,30 +515,50 @@ extern "C" void recomp_audio_output_initialize(void)
     }
     /* The I3DL2 room. XAudio2's reverb takes I3DL2 parameters through
        ReverbConvertI3DL2ToNative, as the console's DSP reverb takes them from
-       IDirectSound_SetI3DL2Listener. RECOMP_AUDIO_REVERB=0 for none. */
+       IDirectSound_SetI3DL2Listener. RECOMP_AUDIO_REVERB=0 for none.
+
+       Two inputs and two outputs, and nothing else. The first version took
+       one input to two (or six) outputs, the console's shape -- a mono I3DL2
+       bin, a multichannel room -- and XAudio2 accepts that voice but does not
+       run it reliably: measured in isolation (Oct 2026), its output was
+       garbage in one run of three, up to 294 dBFS, with nothing sent to it,
+       and 12 dB too loud in the others; at volume 0 it still was. In MK Shaolin
+       Monks the mix read a constant 128-182 dBFS from boot in some runs, with
+       the new mixing switched off, since the reverb is made whatever the title
+       does. Two-in, two-out ran clean every time, silent with silence in and
+       steady with noise. A mono send reaches both inputs at -3 dB
+       (applyLevels). On a 5.1 device its stereo output takes the default
+       upmix. It starts silent -- volume 0 and a room of -10000 -- until a
+       title describes a room. */
     {
         const char *rev = std::getenv("RECOMP_AUDIO_REVERB");
         if (!(rev && std::strcmp(rev, "0") == 0) && master_channels) {
             XAUDIO2_VOICE_DETAILS details{};
             master->GetVoiceDetails(&details);
-            const uint32_t outs = master_channels == 6 ? 6u : 2u;
-            for (uint32_t ins = 1; ins <= 2 && !reverb_voice; ++ins) {
-                IUnknown *apo = nullptr;
-                if (FAILED(XAudio2CreateReverb(&apo, 0))) break;
-                XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, outs};
+            IUnknown *apo = nullptr;
+            if (SUCCEEDED(XAudio2CreateReverb(&apo, 0))) {
+                XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, 2};
                 XAUDIO2_EFFECT_CHAIN chain{1, &effect};
                 XAUDIO2_SEND_DESCRIPTOR d{0, dryTarget()};
                 XAUDIO2_VOICE_SENDS sends{1, &d};
-                if (SUCCEEDED(engine->CreateSubmixVoice(&reverb_voice, ins,
+                if (SUCCEEDED(engine->CreateSubmixVoice(&reverb_voice, 2,
                         details.InputSampleRate, 0, 1, &sends, &chain)))
-                    reverb_inputs = ins;
+                    reverb_inputs = 2;
                 else
                     reverb_voice = nullptr;
                 apo->Release();
             }
-            if (reverb_voice) reverb_voice->SetVolume(0.0f);
+            if (reverb_voice) {
+                XAUDIO2FX_REVERB_I3DL2_PARAMETERS silent = XAUDIO2FX_I3DL2_PRESET_DEFAULT;
+                silent.WetDryMix = 100.0f;
+                silent.Room = -10000;
+                XAUDIO2FX_REVERB_PARAMETERS native{};
+                ReverbConvertI3DL2ToNative(&silent, &native);
+                reverb_voice->SetEffectParameters(0, &native, sizeof native);
+                reverb_voice->SetVolume(0.0f);
+            }
             std::fprintf(stderr, "[audio-output] reverb: %s\n",
-                         reverb_voice ? (reverb_inputs == 1 ? "ready (mono send)" : "ready (stereo send)")
+                         reverb_voice ? "ready (stereo in and out)"
                                       : "could not be made; voices play dry");
         }
     }
