@@ -731,14 +731,31 @@ static float xbox_depth_z_scale(uint32_t format)
     }
 }
 
+/* The multisample factors of the screen surface being drawn into, 1x1 for
+ * any other target (shadow_set_render_target).
+ *
+ * The NV2A rasterises a multisampled screen at the surface's own size, and
+ * the XDK's viewport constants are in those pixels: the viewport scaled by
+ * the factors. Gladius (1x2, a 640x960 screen for its 640x480 device) works
+ * its programs' screen space out itself and arrives at the XDK's numbers --
+ * scale 320, 480, offset 320.53, 480.53 -- and with the undo in the device's
+ * 640x480 every program draw came out at twice its height: the menus below
+ * the screen's bottom edge, the character select cut off at the waist. So
+ * the reserved constants and the undo are both in the surface's pixels; the
+ * host still draws at the device's size, and between the two the factor
+ * cancels for a title that uses the reserved constants. */
+static UINT g_target_aa_x = 1, g_target_aa_y = 1;
+
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
-    float half_w = (float)g_target_width / 2.0f;
-    float half_h = (float)g_target_height / 2.0f;
+    float ax = (float)g_target_aa_x, ay = (float)g_target_aa_y;
+    float half_w = (float)g_target_width / 2.0f * ax;
+    float half_h = (float)g_target_height / 2.0f * ay;
     float reserved[8] = {
-        (float)vp->Width / 2.0f, -(float)vp->Height / 2.0f,
+        (float)vp->Width / 2.0f * ax, -(float)vp->Height / 2.0f * ay,
         (vp->MaxZ - vp->MinZ) * g_z_scale, 1.0f,
-        (float)vp->Width / 2.0f + (float)vp->X, (float)vp->Height / 2.0f + (float)vp->Y,
+        ((float)vp->Width / 2.0f + (float)vp->X) * ax,
+        ((float)vp->Height / 2.0f + (float)vp->Y) * ay,
         vp->MinZ * g_z_scale, 0.0f
     };
     float scale[4]  = { half_w, -half_h, g_z_scale, 1.0f };
@@ -2984,6 +3001,11 @@ static int xbox_vsdt_expanded(uint32_t format, UINT *size)
      * draw through them was skipped as "program without layout" -- about
      * 23 a frame in the menus, the front-end text among them. */
     case 0x31: *size = 6; return 3;
+    /* PBYTE3: three unsigned bytes, 0..1, and no DXGI format of that width.
+     * Gladius's two-bone skinning declarations carry their weights in one at
+     * v9; every draw through them was skipped, which took the faces, hands
+     * and every joint between two bones off its characters. */
+    case 0x34: *size = 3; return 3;
     default:   return 0;
     }
 }
@@ -4456,9 +4478,8 @@ int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
 #define SHADOW_SCRATCH 8
 #define SURFACE_PARENT 20
 
-/* The multisample factors of the screen surface being drawn into, 1x1 for
- * any other target (shadow_set_render_target). */
-static UINT g_target_aa_x = 1, g_target_aa_y = 1;
+/* g_target_aa_x/y, the multisample factors of the screen surface being drawn
+ * into, are defined with the viewport constants above. */
 
 static struct { UINT width, height; IDirect3DTexture8 *texture; } g_scratch[SHADOW_SCRATCH];
 static struct { UINT width, height; IDirect3DSurface8 *surface; } g_depths[SHADOW_SCRATCH];
@@ -5513,6 +5534,11 @@ static uint8_t *shadow_expand_vertices(const void *verts, UINT vertices, UINT *s
                 n[1] = (float)((int32_t)(bits << 10) >> 21) / 1023.0f;
                 n[2] = (float)((int32_t)bits >> 22) / 511.0f;
                 count = 3;
+            } else if (p->packed_format[k] == 0x34u) { /* PBYTE3 */
+                /* The UNORM rule, as PBYTE1/2/4 get from theirs: b / 255. */
+                count = 3;
+                for (c = 0; c < count; c++)
+                    n[c] = (float)at[c] / 255.0f;
             } else if (p->packed_format[k] == 0x31u) { /* NORMSHORT3 */
                 /* The SNORM rule, as NORMSHORT1/2/4 get from their DXGI
                  * formats, so every width agrees: s / 32767, -32768 to -1. */
