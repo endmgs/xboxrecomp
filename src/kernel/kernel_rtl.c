@@ -531,6 +531,25 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* On the same shadow as Enter and Leave, so a section taken with TryEnter is
+ * given back by the Leave that follows. The bridge used to keep a table of
+ * its own for TryEnter while Leave released this one: a TryEnter'd section
+ * then stayed held by that host thread for good, and every other thread's
+ * TryEnter of it failed. Gladius's file completion routine spins on exactly
+ * that, `while (!TryEnter(cs)) ;`, and the loader never finished a read. */
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (!cs)
+        return FALSE;
+    if (!TryEnterCriticalSection(cs))
+        return FALSE;
+    InterlockedIncrement(&g_cs_enters);
+    crt_lock_trace("take", CriticalSection);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing

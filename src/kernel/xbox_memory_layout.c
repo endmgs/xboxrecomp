@@ -2775,7 +2775,12 @@ uint32_t g_xbox_low_shift = 0;
 #define XBOX_THREAD_OBJ_SIZE 0x200u
 #define XBOX_THREAD_ID_OFF   0x12Cu
 
-static uint32_t g_next_guest_thread_id = 0x1000;
+static volatile LONG g_next_guest_thread_id = 0x1000;
+
+uint32_t xbox_ReserveGuestThreadId(void)
+{
+    return (uint32_t)InterlockedIncrement(&g_next_guest_thread_id) - 1u;
+}
 
 uint32_t xbox_CurrentThreadObject(void)
 {
@@ -3764,7 +3769,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         /* The running thread's identity. Zero here made every guest thread
          * look like the same thread; see XBOX_THREAD_OBJ_MAIN above. */
-        MEM32_INIT(FAKE_TLS_VA + XBOX_THREAD_ID_OFF, g_next_guest_thread_id++);
+        MEM32_INIT(FAKE_TLS_VA + XBOX_THREAD_ID_OFF, xbox_ReserveGuestThreadId());
 
         /*
          * XBE TLS directory.
@@ -4556,6 +4561,17 @@ static int g_thread_stacks_used = 0;
  */
 uint32_t xbox_AllocThreadTib(void)
 {
+    return xbox_AllocThreadTibWithId(0);
+}
+
+uint32_t xbox_CurrentGuestThreadId(void)
+{
+    uint32_t obj = xbox_CurrentThreadObject();
+    return obj ? *(const uint32_t *)((uintptr_t)obj + XBOX_THREAD_ID_OFF + g_memory_offset) : 0;
+}
+
+uint32_t xbox_AllocThreadTibWithId(uint32_t thread_id)
+{
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
     const uint32_t tib_size = 0x40;
@@ -4594,7 +4610,7 @@ uint32_t xbox_AllocThreadTib(void)
             memcpy(TIB_VA(obj), TIB_VA(XBOX_THREAD_OBJ_MAIN),
                    XBOX_THREAD_OBJ_SIZE);
             *(uint32_t *)TIB_VA(obj + XBOX_THREAD_ID_OFF) =
-                g_next_guest_thread_id++;
+                thread_id ? thread_id : xbox_ReserveGuestThreadId();
             /* And its own TLS data. KTHREAD.TlsData (+0x28) is where XAPI's
              * thread start-up finds the block it zero-fills and copies the
              * template into; inherited, it was the main thread's block, so

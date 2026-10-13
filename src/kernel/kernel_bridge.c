@@ -493,6 +493,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
+    uint32_t guest_tid;     /* reported to the creator as ThreadId */
 };
 
 /* Object kinds, for ObReferenceObjectByHandle. Declared here because the
@@ -540,7 +541,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
-    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2, guest_tid = s->guest_tid;
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -560,7 +561,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
-        uint32_t tib = xbox_AllocThreadTib();
+        uint32_t tib = xbox_AllocThreadTibWithId(guest_tid);
         if (tib)
             g_fs_base = tib;
         else
@@ -581,14 +582,19 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     return 0;
 }
 
+/* guest_tid is the id GetCurrentThreadId will answer inside the new thread,
+ * chosen by the caller (bridge_thread_id_out) so the creator has already been
+ * told it when the thread starts; 0 takes the next one. */
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1, int suspended,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  uint32_t guest_tid)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->guest_tid = guest_tid;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) free(s);
@@ -613,6 +619,23 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1, int suspended
 /* XBOX_THREAD_MODE_* and xbox_SetThreadMode are declared in xbox_memory_layout.h. */
 static int g_thread_mode = XBOX_THREAD_MODE_INLINE;
 void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
+
+/* PsCreateSystemThread(Ex)'s ThreadId: the id the new thread will answer
+ * GetCurrentThreadId with (KTHREAD +0x12C), written before it runs. A routine
+ * run on the calling thread (the first call, RECOMP_WORKERS=inline) is the
+ * calling thread, so it gets the caller's id. Returns the id for
+ * bridge_spawn_thread.
+ *
+ * It was never written. Gladius's streaming workers serve a request only on
+ * the thread whose id CreateThread handed back, so with 0 there they served
+ * none, and nothing past the archive's index was ever read. */
+static uint32_t bridge_thread_id_out(uint32_t thread_id_ptr, int spawned)
+{
+    uint32_t id = spawned ? xbox_ReserveGuestThreadId() : xbox_CurrentGuestThreadId();
+    if (thread_id_ptr)
+        BRIDGE_MEM32(thread_id_ptr) = id;
+    return id;
+}
 
 static void bridge_PsCreateSystemThreadEx(void)
 {
@@ -657,6 +680,7 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
+                bridge_thread_id_out(STACK_ARG(4), 0);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -692,6 +716,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
+                    bridge_thread_id_out(STACK_ARG(4), 0);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                     return;
                 }
@@ -703,10 +728,12 @@ static void bridge_PsCreateSystemThreadEx(void)
                             "thread stacks, running worker 0x%08X inline\n",
                             start_routine);
                     fflush(stderr);
+                    bridge_thread_id_out(STACK_ARG(4), 0);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1, create_suspended,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    bridge_thread_id_out(STACK_ARG(4), 1));
                     /* A thread handle is signalled when the thread exits, and
                      * a zero-timeout wait on one is a read rather than a
                      * take -- so ObReferenceObjectByHandle may ask it. */
@@ -7582,62 +7609,9 @@ static void bridge_RtlUshortByteSwap(void)
 }
 
 /* ── Rtl Critical sections (ordinals 278, 295, 306) ─────────
- * 277/294 (plain Enter/Leave) are routed via the xbox_Rtl* wrappers already.
- *
- * TryEnter cannot reuse xbox_cs_shadow (it is private to kernel_rtl.c), so it
- * keeps its own keyed host-lock table: guest critical-section address -> host
- * CRITICAL_SECTION, created and probed under a guard.  Only the try path uses
- * it, so entering with Try and leaving with LeaveCriticalSection are both
- * routed at the shadow level and stay consistent on the host side. */
-
-#define BRIDGE_TRY_CS_SLOTS 512
-
-typedef struct {
-    uint32_t key;             /* guest critical section; 0 means free */
-    int      ready;
-    CRITICAL_SECTION cs;
-} BRIDGE_TRY_CS_SLOT;
-
-static BRIDGE_TRY_CS_SLOT g_try_cs[BRIDGE_TRY_CS_SLOTS];
-static CRITICAL_SECTION g_try_cs_guard;
-static int g_try_cs_guard_ready;
-
-static void bridge_try_cs_init_guard(void)
-{
-    /* First call in practice comes from the title's main thread during setup;
-     * a second InitializeCriticalSection on the same object is benign. */
-    if (!g_try_cs_guard_ready) {
-        InitializeCriticalSection(&g_try_cs_guard);
-        g_try_cs_guard_ready = 1;
-    }
-}
-
-static CRITICAL_SECTION *bridge_try_cs_shadow(uint32_t guest)
-{
-    size_t home, i;
-
-    bridge_try_cs_init_guard();
-    EnterCriticalSection(&g_try_cs_guard);
-    home = (size_t)((guest >> 4) % BRIDGE_TRY_CS_SLOTS);
-    for (i = 0; i < BRIDGE_TRY_CS_SLOTS; i++) {
-        BRIDGE_TRY_CS_SLOT *slot = &g_try_cs[(home + i) % BRIDGE_TRY_CS_SLOTS];
-        if (slot->key == guest) {
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-        if (slot->key == 0) {
-            if (!slot->ready) {
-                InitializeCriticalSection(&slot->cs);
-                slot->ready = 1;
-            }
-            slot->key = guest;
-            LeaveCriticalSection(&g_try_cs_guard);
-            return &slot->cs;
-        }
-    }
-    LeaveCriticalSection(&g_try_cs_guard);
-    return NULL;
-}
+ * 277/294 (plain Enter/Leave) are routed via the xbox_Rtl* wrappers already,
+ * and so is TryEnter: all three must share one host lock per guest section
+ * (kernel_rtl.c's), or a Leave gives back a lock its Enter never took. */
 
 /* 278: VOID RtlEnterCriticalSectionAndRegion(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlEnterCriticalSectionAndRegion(void)
@@ -7656,9 +7630,8 @@ static void bridge_RtlLeaveCriticalSectionAndRegion(void)
 /* 306: BOOLEAN RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION) */
 static void bridge_RtlTryEnterCriticalSection(void)
 {
-    CRITICAL_SECTION *cs = bridge_try_cs_shadow(STACK_ARG(0));
-    if (!cs) { g_eax = 0; return; }
-    g_eax = TryEnterCriticalSection(cs) ? 1 : 0;
+    g_eax = xbox_RtlTryEnterCriticalSection(
+                (PRTL_CRITICAL_SECTION)XBOX_TO_NATIVE(STACK_ARG(0))) ? 1 : 0;
 }
 
 /* ── Rtl Misc stubs (ordinals 288, 297, 319, 321) ─────────── */
@@ -9377,6 +9350,7 @@ static void bridge_PsCreateSystemThread(void)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+                bridge_thread_id_out(STACK_ARG(3), 0);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -9387,16 +9361,19 @@ static void bridge_PsCreateSystemThread(void)
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
+                    bridge_thread_id_out(STACK_ARG(3), 0);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                     g_eax = 0;
                     return;
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
+                    bridge_thread_id_out(STACK_ARG(3), 0);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1, 0,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    bridge_thread_id_out(STACK_ARG(3), 1));
                     /* A thread handle is signalled when the thread exits, and
                      * a zero-timeout wait on one is a read rather than a
                      * take -- so ObReferenceObjectByHandle may ask it. */
