@@ -496,13 +496,18 @@ void sub_00202FF0(void)
  *
  * With widescreen on, it is called with the height a 16:9 screen of this
  * width would have, so the engine renders the anamorphic frame a 16:9 Xbox
- * title renders; the screen size it keeps (0x004C0AC8/CC, read in 58 places)
+ * title renders; the screen size it keeps (height 0x004C0AC8, width 0x004C0ACC,
+ * read in 58 places)
  * and the half-pixel offset it derives from it go back to the real ones.
  *
- * EXPERIMENTAL, off unless RECOMP_GLADIUS_WIDE=1 (with widescreen on): the
- * 2D comes out right (4:3, centred, nothing stretched) and the 3D's field
- * of view is right, but the 3D viewport rectangle is still worked out in
- * the 4:3 UI space and lands in a box (x 80-440, y 60-360 of the frame).
+ * With that the 3D fills the 16:9 picture. The 2D is the renderer's to
+ * place: the menus are drawn for 4:3 and stay at 4:3, centred, with their
+ * backdrops built from several textured pieces -- so only whole-screen
+ * flat-colour passes (the fades and the cutscenes' letterbox bars) may span
+ * the picture, which is the renderer's centre policy (widescreen_2d =
+ * centre, which the project declares: CENTRE_2D in CMakeLists.txt). The 3D is told apart from the 2D by the
+ * projection register, c176 (recomp_title_widescreen in CMakeLists.txt).
+ * RECOMP_GLADIUS_WIDE=0 leaves the engine at 4:3.
  */
 extern void sub_001BBD60_gen(void);
 int xbox_EnvSwitch(const char *name, int default_on);
@@ -514,7 +519,7 @@ void sub_001BBD60(void)
     static int on = -1;
 
     if (on < 0)
-        on = xbox_EnvSwitch("RECOMP_GLADIUS_WIDE", 0) &&
+        on = xbox_EnvSwitch("RECOMP_GLADIUS_WIDE", 1) &&
              recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
     if (!on || !w || !h) {
         sub_001BBD60_gen();
@@ -524,10 +529,10 @@ void sub_001BBD60(void)
     GLAD_MEM32(g_esp + 8) = h_eff;
     sub_001BBD60_gen();
     GLAD_MEM32(g_esp + 8) = h;
-    GLAD_MEM32(0x004C0ACCu) = h;
+    GLAD_MEM32(0x004C0AC8u) = h;      /* height; 0x004C0ACC is the width */
     {
         /* It took 0.5 / height off the ortho's y translation; take the real one. */
-        float *ty = (float *)((uintptr_t)0x004AA9B8u + g_xbox_mem_offset);
+        float *ty = (float *)((uintptr_t)0x004AA9BCu + g_xbox_mem_offset);
         *ty += 0.5f / (float)h_eff - 0.5f / (float)h;
     }
     fprintf(stderr, "[GLADIUS] widescreen: the engine's aspect from %ux%u, as a 16:9 "
@@ -573,3 +578,4 @@ void sub_001FC860(void)
         }
     }
 }
+

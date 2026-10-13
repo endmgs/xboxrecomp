@@ -178,4 +178,7 @@ endif()
 # # is the vertex constant register holding its projection, 60 if left out.
 # # A game nobody has described is treated as NATIVE, and looks stretched
 # # if it is not. See src/config/CMakeLists.txt.
-# recomp_title_widescreen(HOR_PLUS REGISTER 60)
+# Gladius's engine widens its own view for a 16:9 screen (recomp_manual.c,
+# sub_001BBD60); its 3D programs project through c176..c179, so that is the
+# register that tells the renderer a draw is 3D and not to be kept at 4:3.
+recomp_title_widescreen(NATIVE REGISTER 176 CENTRE_2D)
