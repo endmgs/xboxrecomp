@@ -1239,6 +1239,24 @@ static void do_draw_indexed_up(Replay *r, const D3D8CapChunk *c)
                 d->num_vertices, d->min_index, d->vertex_bytes,
                 ix[0], ix[1], ix[2], ix[3],
                 ix[0], f[0], f[1], f[2], f[3], ix[1], g[0], g[1], g[2], g[3]);
+        {
+            /* RECOMP_REPLAY_VERTEX_DUMP=<draw>: every vertex of that draw as
+             * raw words, for a vertex that lands somewhere it should not --
+             * a stray bone index or weight is invisible in floats. */
+            const char *e = getenv("RECOMP_REPLAY_VERTEX_DUMP");
+            if (e && *e && atol(e) == g_draw_index - 1) {
+                uint32_t v, k;
+                for (v = 0; v < d->num_vertices; v++) {
+                    const uint32_t *w = (const uint32_t *)((const uint8_t *)verts +
+                                                           (size_t)(d->min_index + v) * d->stride);
+                    fprintf(stderr, "[draw %4ld]   vertex %u:", g_draw_index - 1,
+                            d->min_index + v);
+                    for (k = 0; k < d->stride / 4u; k++)
+                        fprintf(stderr, " %08X", w[k]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
     }
     if (FAILED(r->dev->lpVtbl->DrawIndexedPrimitiveUP(
             r->dev, (D3DPRIMITIVETYPE)d->prim_type, d->min_index, d->num_vertices,

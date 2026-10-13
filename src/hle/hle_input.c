@@ -295,6 +295,23 @@ HLE_EXPORT(XInputGetState)
 
     if (!out)
         HLE_RETURN(ERR_INVALID_PARAMETER);
+    if (input_log_wanted()) {
+        /* How often the title asks at all, every five seconds: a title that
+         * stops reading the pad and one whose reads all come back idle look
+         * the same in the held-buttons lines below. */
+        static volatile LONG calls;
+        static ULONGLONG next_report;
+        ULONGLONG now = GetTickCount64();
+        LONG n = InterlockedIncrement(&calls);
+        if (!next_report)
+            next_report = now + 5000;
+        else if (now >= next_report) {
+            next_report = now + 5000;
+            InterlockedExchange(&calls, 0);
+            fprintf(stderr, "[INPUT] XInputGetState: %ld calls in the last 5 s\n", (long)n);
+            fflush(stderr);
+        }
+    }
     /* The device bound to this handle's own port, sampled outside the lock:
      * reading four host devices inside one critical section would serialise
      * four guest threads on the slowest of them. */

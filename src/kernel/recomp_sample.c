@@ -21,6 +21,10 @@
  *   RECOMP_SAMPLE_DUMP=<path>   write the full per-symbol table there, rewritten
  *                               at every report so a killed run leaves one
  *   RECOMP_SAMPLE_DEPTH=<n>     native frames per sample (8; 1 is leaf only)
+ *   RECOMP_SAMPLE_START=<s>     take no samples for the first s seconds, so
+ *                               the report is the state a run settles into
+ *                               (a hang an input script reaches after two
+ *                               minutes) rather than everything before it
  *
  * Two views come out. "Leaf" is the function the thread was executing:
  * exclusive time, which names the hot instruction sequences. "Inclusive" is
@@ -952,6 +956,8 @@ static void report_at_exit(void) { report(1); }
 
 /* --------------------------------------------------------------- driver */
 
+static double s_start_secs;       /* RECOMP_SAMPLE_START */
+
 static DWORD WINAPI sampler_thread(LPVOID unused)
 {
 #ifdef _WIN32
@@ -1004,6 +1010,11 @@ static DWORD WINAPI sampler_thread(LPVOID unused)
         }
 #endif
         QueryPerformanceCounter(&now);
+        if (s_start_secs > 0.0 &&
+            (double)(now.QuadPart - s_t0.QuadPart) / (double)s_qpf.QuadPart < s_start_secs) {
+            last_report = now;
+            continue;
+        }
         if (now.QuadPart - last_refresh.QuadPart > s_qpf.QuadPart) {
             refresh_threads();
             last_refresh = now;
@@ -1061,6 +1072,8 @@ void xbox_SamplerStart(void)
     if (v && atof(v) > 0.0) s_report_secs = atof(v);
     v = getenv("RECOMP_SAMPLE_DEPTH");
     if (v && atoi(v) > 0) s_depth = atoi(v);
+    v = getenv("RECOMP_SAMPLE_START");
+    if (v && atof(v) > 0.0) s_start_secs = atof(v);
 
 #ifdef _WIN32
     s_main_tid = GetCurrentThreadId();
