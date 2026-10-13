@@ -184,6 +184,19 @@ static uint32_t console_av_region(void)
     }
 }
 
+/* PAL60: whether a PAL console says it can show 60 Hz (the dashboard's
+ * "PAL 60" setting, XC_VIDEO_FLAGS_60Hz). A title that supports it picks a
+ * 60 Hz mode and runs its own 60 Hz timing; told 50, it asks for 50 Hz and
+ * paces itself for 50 while the host shows 60. Gladius (sub_001E0E40) reads
+ * exactly this bit to choose 60 or 50. On by default, since a PAL60 console
+ * is the one that matches how the host presents; RECOMP_PAL60=0 (pal60 = 0)
+ * is a 50 Hz-only PAL console. Nothing changes on an NTSC console. */
+int xbox_kernel_console_pal60(void)
+{
+    return console_av_region() == XC_AV_STANDARD_PAL_I &&
+           recomp_config_bool("RECOMP_PAL60", "pal60", 1);
+}
+
 /* The same answer for AvSendTVEncoderOption (kernel_hal.c), which reports the
  * video standard and refresh in the same bits: a title reads its standard from
  * one and D3D validates the mode against the other, so they must agree. */
@@ -230,6 +243,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
             if (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0))
                 flags |= XC_VIDEO_FLAGS_WIDESCREEN;
+            if (xbox_kernel_console_pal60())
+                flags |= XC_VIDEO_FLAGS_60Hz;
             *(PULONG)Value = XC_VIDEO_RAW(flags);
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);

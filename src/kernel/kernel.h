@@ -1111,6 +1111,10 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
  * disc's region; kernel_xbox.c. */
 uint32_t xbox_kernel_console_av_standard(void);
 
+/* A PAL console that also offers 60 Hz (RECOMP_PAL60, on by default); 0 on
+ * an NTSC console. kernel_xbox.c. */
+int xbox_kernel_console_pal60(void);
+
 /* Game region the XBE certificate allows, as parsed during layout init, or 0
  * if there was no mapped XBE to read it from. */
 uint32_t xbox_kernel_get_xbe_game_region(void);

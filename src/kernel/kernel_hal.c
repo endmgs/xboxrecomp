@@ -835,7 +835,10 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * no device while one that ignored it was fine. The AV_FLAGS_*
          * values below are the XC_VIDEO (EEPROM) layout the two capability
          * queries use, not this word's, so the bit is spelt out here. */
+        /* A PAL60 console offers 60 Hz beside the standard's 50, or D3D
+         * refuses the 60 Hz mode the title then asks for. */
         *Result = AV_PACK_HDTV | xbox_kernel_console_av_standard()
+                | (xbox_kernel_console_pal60() ? AV_REFRESH_60Hz : 0)
                 | (recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0)
                    ? 0x00010000u /* AV_FLAGS_WIDESCREEN, AV pack word layout */ : 0);
         break;
