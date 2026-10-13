@@ -345,7 +345,8 @@ typedef struct NV2APSConstants {
 #define NV2A_FOG_SRC_FACTOR        0u  /* fog off, or fixed-function vertex fog */
 #define NV2A_FOG_SRC_PROGRAM_TABLE 1u  /* program oFog is the distance; table mode */
 #define NV2A_FOG_SRC_VIEW_TABLE    2u  /* fixed function, table fog from view depth */
-#define NV2A_FOG_SRC_PROGRAM       3u  /* program oFog, linear through start..end */
+#define NV2A_FOG_SRC_PROGRAM       3u  /* program oFog, linear through start..end (unused:
+                                               * with no table mode oFog is the factor) */
 
 /* ================================================================
  * Public API

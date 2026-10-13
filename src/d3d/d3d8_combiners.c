@@ -1608,10 +1608,13 @@ BOOL d3d8_combiners_prepare_draw(void)
             memcpy(&cb->fog_params[2], &rs[D3DRS_FOGDENSITY], sizeof(float));
             cb->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
             cb->fog_range = rs[D3DRS_RANGEFOGENABLE] ? 1 : 0;
+            /* Only table fog is mapped here. With no table mode a program's
+             * oFog stays the factor itself, as D3D vertex fog has it: mapped
+             * linearly through start..end, Need for Speed Underground 2's
+             * world (fog on, FOGTABLEMODE NONE) came out the fog colour,
+             * a black screen. */
             if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE)
                 cb->fog_src = program ? NV2A_FOG_SRC_PROGRAM_TABLE : NV2A_FOG_SRC_VIEW_TABLE;
-            else if (program)
-                cb->fog_src = NV2A_FOG_SRC_PROGRAM;
         }
         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
             IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);
