@@ -68,7 +68,11 @@ const D3D8DisplayPolicy *d3d8_display_policy(void)
         g_policy.widescreen = recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
 
         v = recomp_config_lookup("RECOMP_WIDESCREEN_2D", "widescreen_2d");
-        g_policy.centre_2d = v && (strcmp(v, "centre") == 0 || strcmp(v, "center") == 0);
+        /* auto -- what a new settings file says -- is the title's own
+         * default: centre where its project declared CENTRE_2D. */
+        g_policy.centre_2d = (v && (strcmp(v, "centre") == 0 || strcmp(v, "center") == 0)) ||
+                             ((!v || !*v || strcmp(v, "auto") == 0) &&
+                              recomp_widescreen_title_centre_2d());
         if (v && *v && !g_policy.centre_2d && strcmp(v, "auto") != 0)
             fprintf(stderr, "D3D8 display: RECOMP_WIDESCREEN_2D=%s is neither auto nor "
                     "centre; using auto\n", v);

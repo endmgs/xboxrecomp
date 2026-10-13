@@ -20,6 +20,12 @@ endif()
 #
 #     recomp_title_widescreen(NATIVE)                  # has a 16:9 mode
 #     recomp_title_widescreen(HOR_PLUS REGISTER 60)    # has none
+#     recomp_title_widescreen(NATIVE REGISTER 176 CENTRE_2D)
+#
+# CENTRE_2D: the game's 2D is drawn for 4:3 even in its 16:9 mode, so keep
+# all of it at 4:3 but whole-screen flat-colour passes (fades, letterbox
+# bars) -- the widescreen_2d = centre policy, as what widescreen_2d = auto
+# means for this title.
 #
 # The player has one widescreen switch. Whether that is the console flag
 # alone or the flag and a wider camera is a fact about the game, and so is
@@ -33,7 +39,7 @@ endif()
 # A title where widescreen cannot be right at all says so to its launcher
 # instead: recomp_add_launcher(... NO_WIDESCREEN).
 function(recomp_title_widescreen MODE)
-    cmake_parse_arguments(_wide "" "REGISTER" "" ${ARGN})
+    cmake_parse_arguments(_wide "CENTRE_2D" "REGISTER" "" ${ARGN})
     if(MODE STREQUAL "NATIVE")
         set(_mode 1)                                # RECOMP_WIDE_NATIVE
     elseif(MODE STREQUAL "HOR_PLUS")
@@ -47,6 +53,9 @@ function(recomp_title_widescreen MODE)
             "recomp_title_widescreen: unexpected \"${_wide_UNPARSED_ARGUMENTS}\"")
     endif()
     target_compile_definitions(xbox_config PRIVATE RECOMP_TITLE_WIDESCREEN=${_mode})
+    if(_wide_CENTRE_2D)
+        target_compile_definitions(xbox_config PRIVATE RECOMP_TITLE_CENTRE_2D=1)
+    endif()
     if(DEFINED _wide_REGISTER)
         if(NOT _wide_REGISTER MATCHES "^[0-9]+$" OR _wide_REGISTER GREATER 191)
             message(FATAL_ERROR

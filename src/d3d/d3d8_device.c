@@ -2171,6 +2171,11 @@ BOOL d3d8_GetTwoDSqueeze(void) { return g_2d_squeeze; }
  * the register it copies oPos from. */
 /* Whether the last draw_extent measured a fixed-function draw. */
 static BOOL g_extent_fixed_function;
+/* Whether its vertices carry a position and nothing else: whatever the
+ * stages hold, nothing varies across such a draw but where it is, so it is
+ * flat colour. Gladius draws its fades and letterbox bars that way with the
+ * last real texture still bound. */
+static BOOL g_extent_position_only;
 
 /* The title's own test for a screen-space draw (xbox_D3D8SetScreenSpaceTest),
  * and what it said of the draw in hand. */
@@ -2190,8 +2195,11 @@ static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
     UINT offset = 0, i;
     DWORD handle = g_device_state.vertex_shader;
     float lo = 3.4e38f, hi = -3.4e38f;
+    float map_scale = 1.0f, map_offset = 0.0f;
+    int mapped = 0;
 
     g_extent_fixed_function = FALSE;
+    g_extent_position_only = FALSE;
     if (!p || !stride || !count)
         return FALSE;
     /* A draw the title's own test called screen-space: the extent is the
@@ -2213,6 +2221,8 @@ static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
 
         if (reg < 0 || !d3d8_vsh_bound_input_offset(reg, &offset))
             return FALSE;
+        mapped = d3d8_vsh_bound_pos_map(&map_scale, &map_offset);
+        g_extent_position_only = offset == 0 && stride <= 3u * sizeof(float);
     } else if (d3d8_fvf_transformed(handle)) {
         /* Fixed function: the handle is the FVF, and a pre-transformed
          * vertex starts with its screen position. Asking the program
@@ -2247,6 +2257,29 @@ static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
         if (x > hi) hi = x;
     }
 
+    /* A program that maps its positions itself (oPos = v * c[a] + c[b]):
+     * its pixels, then the guest's, through the same screen-space undo the
+     * host program applies -- the mapping is in the render target's own
+     * pixels, which for a multisampled screen are not the guest's. Without
+     * this Gladius's -1..1 quads measured two pixels wide, so its fades and
+     * letterbox bars never escaped the squeeze and covered only the middle
+     * of a widescreen picture. */
+    if (mapped) {
+        float sc[4], so[4], a, b;
+        int ss_on = 0;
+        UINT gw = d3d8_GetGuestWidth();
+
+        a = lo * map_scale + map_offset;
+        b = hi * map_scale + map_offset;
+        d3d8_vsh_get_screenspace(sc, so, &ss_on);
+        if (ss_on && sc[0] != 0.0f && gw) {
+            a = ((a - so[0]) / sc[0] + 1.0f) * 0.5f * (float)gw;
+            b = ((b - so[0]) / sc[0] + 1.0f) * 0.5f * (float)gw;
+        }
+        lo = a < b ? a : b;
+        hi = a < b ? b : a;
+    }
+
     /* What the draw can reach, not what it is: a quad the size of the
      * screen under a scissor the size of a menu box is that box's
      * background. TimeSplitters 2 fills its difficulty list that way, and
@@ -2264,8 +2297,8 @@ static BOOL draw_extent(const void *vertices, UINT stride, UINT count,
 }
 
 /* Whether the bound textures make a draw a pass over the whole screen
- * rather than a picture placed on it: stage 0 is nothing or a single
- * texel (flat colour), or some stage holds a copy of the frame.
+ * rather than a picture placed on it: stage 0 is nothing or a few texels
+ * (flat colour), or some stage holds a copy of the frame.
  *
  * Only stage 0 is asked about pictures. A title leaves textures bound on
  * stages its shader never reads, so a later stage holding something
@@ -2286,7 +2319,19 @@ static BOOL draw_is_screen_pass(void)
     tex = d3d8_GetStageTexture(0);
     if (!tex)
         return TRUE;
-    return d3d8_base_size(tex, &w, &h) && w <= 1 && h <= 1;
+    /* A frame the title rendered itself, the screen's size: a picture of the
+     * screen, which spans it. Gladius crossfades between two such snapshots
+     * at its scene changes, and squeezed, the outgoing scene shrank into
+     * the middle of the incoming one. */
+    if (IDirect3DBaseTexture8_GetType(tex) == D3DRTYPE_TEXTURE &&
+        (((D3D8Texture *)tex)->usage & D3DUSAGE_RENDERTARGET) &&
+        d3d8_base_size(tex, &w, &h) && w >= d3d8_GetGuestWidth() &&
+        h >= d3d8_GetGuestHeight())
+        return TRUE;
+    /* Up to 4x4: Gladius keeps a 4x4 white texture bound for its
+     * untextured quads, its fades and cutscene letterbox bars among them,
+     * and at 1x1 they stayed in the centred 4:3 box. */
+    return d3d8_base_size(tex, &w, &h) && w <= 4 && h <= 4;
 }
 
 /* Does this draw cover the guest's full width, and so escape the 2D
@@ -2339,7 +2384,8 @@ BOOL d3d8_draw_escapes_squeeze(const void *vertices, UINT stride, UINT count)
      * itself back over the frame, which squeezed would put a shrunken copy
      * of the picture in the middle of it. */
     if (d3d8_display_policy()->centre_2d)
-        return ((hi - lo) >= (float)guest_w * 0.98f && draw_is_screen_pass())
+        return ((hi - lo) >= (float)guest_w * 0.98f &&
+                (draw_is_screen_pass() || g_extent_position_only))
                ? TRUE : FALSE;
     /* A fixed-function draw escapes only if it covers the whole width. The
      * 75% gap above was measured on program draws; OutRun 2 batches HUD

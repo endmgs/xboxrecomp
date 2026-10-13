@@ -271,6 +271,9 @@ uint32_t d3d8_vsh_bound_reads(int first, int count);
  * Together these let the draw path measure how wide a screen-space draw
  * is without knowing anything about the title. */
 int  d3d8_vsh_bound_pos_input(void);
+/* For a bound program that maps its position through constants (oPos =
+ * v * c[a] + c[b]), their x components now; 0 when it copies oPos as is. */
+int  d3d8_vsh_bound_pos_map(float *scale, float *offset);
 int  d3d8_vsh_bound_input_offset(int reg, UINT *offset);
 
 /**

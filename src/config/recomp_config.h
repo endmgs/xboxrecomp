@@ -117,6 +117,9 @@ typedef enum RecompWideMode {
  * renderer tells a 3D draw from a screen-space one in widescreen. */
 void           recomp_widescreen_title(RecompWideMode mode, int projection_register);
 RecompWideMode recomp_widescreen_title_mode(void);
+/* Whether the title's project asked for the centre 2D policy by default
+ * (recomp_title_widescreen ... CENTRE_2D); widescreen_2d overrides it. */
+int            recomp_widescreen_title_centre_2d(void);
 /* Changes whenever the above is called, so a caller that keeps the
  * resolution below knows to ask again. */
 unsigned       recomp_widescreen_title_serial(void);

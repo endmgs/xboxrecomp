@@ -761,6 +761,15 @@ int recomp_config_bool(const char *env_name, const char *key, int fallback)
 #define RECOMP_TITLE_PROJECTION_REGISTER (-1)
 #endif
 
+#ifndef RECOMP_TITLE_CENTRE_2D
+#define RECOMP_TITLE_CENTRE_2D 0
+#endif
+
+int recomp_widescreen_title_centre_2d(void)
+{
+    return RECOMP_TITLE_CENTRE_2D;
+}
+
 static RecompWideMode g_wide_mode = (RecompWideMode)(RECOMP_TITLE_WIDESCREEN);
 static int            g_wide_register = (RECOMP_TITLE_PROJECTION_REGISTER);
 static unsigned       g_wide_serial;

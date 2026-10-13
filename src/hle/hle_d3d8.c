@@ -4478,6 +4478,27 @@ HLE_EXPORT(D3DDevice_SetViewport)
     uint32_t viewport = HLE_ARG(0);
 
     first_call(&seen, "D3DDevice_SetViewport", viewport);
+    if (viewport && xbox_EnvSwitch("RECOMP_HLE_D3D8_TRACE_VIEWPORT", 0)) {
+        /* Every distinct viewport the title sets, once, with its caller:
+         * where a title computes the rectangle it draws its 3D into. */
+        static struct { uint32_t x, y, w, h, from; } seenvp[64];
+        static int nseen;
+        uint32_t x = HLE_MEM32(viewport), y = HLE_MEM32(viewport + 4u);
+        uint32_t w = HLE_MEM32(viewport + 8u), h = HLE_MEM32(viewport + 12u);
+        uint32_t from = HLE_MEM32(g_esp);
+        int i;
+        for (i = 0; i < nseen; i++)
+            if (seenvp[i].x == x && seenvp[i].y == y && seenvp[i].w == w &&
+                seenvp[i].h == h && seenvp[i].from == from)
+                break;
+        if (i == nseen && nseen < 64) {
+            seenvp[nseen].x = x; seenvp[nseen].y = y; seenvp[nseen].w = w;
+            seenvp[nseen].h = h; seenvp[nseen++].from = from;
+            fprintf(stderr, "[HLE-D3D8] viewport %u,%u %ux%u from 0x%08X (swap %lu)\n",
+                    x, y, w, h, from, g_shadow_swaps);
+            fflush(stderr);
+        }
+    }
     if (original_missing(hle_original_D3DDevice_SetViewport, "D3DDevice_SetViewport"))
         HLE_RETURN(0x80004005u);
     HLE_CALL_ORIGINAL(D3DDevice_SetViewport);
