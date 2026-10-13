@@ -481,3 +481,56 @@ void sub_00202FF0(void)
     gladius_wait_ready("sub_00202FF0");
     sub_00202FF0_gen();
 }
+
+/* ── Gladius: widescreen through the engine's own aspect ───── */
+
+/*
+ * sub_001BBD60(width, height) runs once at start-up with the device's
+ * 640x480. From height / width it sets the 2D layer's orthographic matrix
+ * (0x004AA988, through sub_001AEFB0) and the x and y factors the 3D
+ * projection takes (0x004C0AC4 / 0x004C0AC0, read by sub_0019E690): for a
+ * screen wider than 4:3 it widens the view horizontally and keeps the 2D at
+ * 4:3 proportions -- Hor+, in the engine. The Xbox build never hands it
+ * anything but 640x480, and asks D3D for a 4:3 mode whatever the console
+ * says (sub_001E0E40 pushes 0 for the widescreen argument of its mode pick).
+ *
+ * With widescreen on, it is called with the height a 16:9 screen of this
+ * width would have, so the engine renders the anamorphic frame a 16:9 Xbox
+ * title renders; the screen size it keeps (0x004C0AC8/CC, read in 58 places)
+ * and the half-pixel offset it derives from it go back to the real ones.
+ *
+ * EXPERIMENTAL, off unless RECOMP_GLADIUS_WIDE=1 (with widescreen on): the
+ * 2D comes out right (4:3, centred, nothing stretched) and the 3D's field
+ * of view is right, but the 3D viewport rectangle is still worked out in
+ * the 4:3 UI space and lands in a box (x 80-440, y 60-360 of the frame).
+ */
+extern void sub_001BBD60_gen(void);
+int xbox_EnvSwitch(const char *name, int default_on);
+int recomp_config_bool(const char *env, const char *key, int fallback);
+
+void sub_001BBD60(void)
+{
+    uint32_t w = GLAD_MEM32(g_esp + 4), h = GLAD_MEM32(g_esp + 8), h_eff;
+    static int on = -1;
+
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_GLADIUS_WIDE", 0) &&
+             recomp_config_bool("RECOMP_WIDESCREEN", "widescreen", 0);
+    if (!on || !w || !h) {
+        sub_001BBD60_gen();
+        return;
+    }
+    h_eff = (w * 9u + 8u) / 16u;
+    GLAD_MEM32(g_esp + 8) = h_eff;
+    sub_001BBD60_gen();
+    GLAD_MEM32(g_esp + 8) = h;
+    GLAD_MEM32(0x004C0ACCu) = h;
+    {
+        /* It took 0.5 / height off the ortho's y translation; take the real one. */
+        float *ty = (float *)((uintptr_t)0x004AA9B8u + g_xbox_mem_offset);
+        *ty += 0.5f / (float)h_eff - 0.5f / (float)h;
+    }
+    fprintf(stderr, "[GLADIUS] widescreen: the engine's aspect from %ux%u, as a 16:9 "
+                    "screen of %u pixels' width; frame stays %ux%u\n", w, h_eff, w, w, h);
+    fflush(stderr);
+}

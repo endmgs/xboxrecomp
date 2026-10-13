@@ -993,6 +993,7 @@ HLE_EXPORT(CDirectSoundStream_SetVolume)
     uint32_t object = HLE_ARG(0), volume = HLE_ARG(1);
     Stream *s;
 
+    stream_trace("SetVolume", object, volume, 0u);
     lock();
     s = find_by_object(object);
     if (s)
