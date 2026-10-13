@@ -311,7 +311,14 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
         break;
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr) {
-            sb_append(sb, "c[a0 + %d]", src->reg_index);
+            /* Through crel: an index off either end reads zero, as D3D11
+             * makes any out-of-range constant read. Vulkan does not, and
+             * a skinned vertex with one bone names its unused second bone
+             * -1 (Gladius: index -1.0, weight 0), so c[-1] times 0 was
+             * whatever lay before the buffer times 0 -- NaN on MoltenVK,
+             * a vertex thrown to infinity, and a long beam across the
+             * arena from every such character. */
+            sb_append(sb, "crel(a0 + %d)", src->reg_index);
             g_emit_const_indexed = 1;
         } else {
             sb_append(sb, "c[%d]", src->reg_index);
@@ -718,6 +725,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 c[%d];\n"
         "};\n"
         "\n"
+        "float4 crel(int i) {\n"
+        "    return (uint)i < %du ? c[i] : float4(0, 0, 0, 0);\n"
+        "}\n"
+        "\n"
         "cbuffer VSH_Screenspace : register(b2) {\n"
         "    float4 xboxScreenspaceScale;\n"
         "    float4 xboxScreenspaceOffset;\n"
@@ -728,7 +739,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 xboxVertexData[%d];\n"
         "    float4 xboxVertexFed[4];\n"
         "};\n"
-        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
+        "\n", NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_CONSTANTS, NV2A_VS_MAX_INPUTS);
 
     /* Input structure - only declare used inputs */
     sb_append(&sb, "struct VS_IN {\n");

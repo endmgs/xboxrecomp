@@ -105,6 +105,41 @@ HLE_EXPORT(D3DDevice_SetFlickerFilter)
     HLE_RETURN(0);
 }
 
+/* void D3DDevice_SetShaderConstantMode(D3DSHADERCONSTANTMODE Mode): the
+ * title's own body, then the mode is kept so the shadow device knows whether
+ * the reserved viewport constants are its to write (shadow_viewport_constants). */
+HLE_ORIGINAL(D3DDevice_SetShaderConstantMode);
+static uint32_t g_shader_constant_mode;
+static int original_missing(void (*fn)(void), const char *name);
+HLE_EXPORT(D3DDevice_SetShaderConstantMode)
+{
+    static int seen;
+    uint32_t mode = HLE_ARG(0);
+
+    first_call(&seen, "D3DDevice_SetShaderConstantMode", mode);
+    if (!original_missing(hle_original_D3DDevice_SetShaderConstantMode,
+                          "D3DDevice_SetShaderConstantMode"))
+        HLE_CALL_ORIGINAL(D3DDevice_SetShaderConstantMode);
+    if (mode != g_shader_constant_mode) {
+        static int said;
+        if (said++ < 8) {
+            fprintf(stderr, "[HLE-D3D8] shader constant mode 0x%02X -> 0x%02X\n",
+                    g_shader_constant_mode, mode);
+            fflush(stderr);
+        }
+    }
+    g_shader_constant_mode = mode;
+    HLE_RETURN(0);
+}
+
+/* Whether the title owns constants 58 and 59 (X_D3DSCM_NORESERVEDCONSTANTS,
+ * 0x10), so neither the viewport nor anything else of shadow mode's goes
+ * there. */
+int hle_d3d8_reserved_constants_free(void)
+{
+    return (g_shader_constant_mode & 0x10u) != 0;
+}
+
 /* void D3DDevice_SetSoftDisplayFilter(BOOL Enable) -- TV encoder only. */
 HLE_EXPORT(D3DDevice_SetSoftDisplayFilter)
 {
@@ -713,8 +748,11 @@ static IDirect3DSurface8 *g_device_depth;
  * render target (shadow_set_render_target), the CreateDevice one to begin
  * with.
  *
- * Not handled: X_D3DSCM_NORESERVEDCONSTANTS, which frees 58 and 59 for the
- * title (a title that then sets them wins until its next SetViewport). */
+ * Under X_D3DSCM_NORESERVEDCONSTANTS (D3DDevice_SetShaderConstantMode) 58
+ * and 59 are the title's, and nothing is written there: Gladius keeps a bone
+ * of its skinning palette in c-39..c-37, and with the viewport written over
+ * two of its rows every vertex weighted to that bone went to y = 1.2e7 -- a
+ * beam across the arena from each character. */
 static float        g_z_scale = 1.0f;
 static D3DVIEWPORT8 g_title_viewport;
 static int          g_title_viewport_set;
@@ -746,6 +784,9 @@ static float xbox_depth_z_scale(uint32_t format)
  * cancels for a title that uses the reserved constants. */
 static UINT g_target_aa_x = 1, g_target_aa_y = 1;
 
+/* D3DDevice_SetShaderConstantMode's last mode is g_shader_constant_mode. */
+#define X_D3DSCM_NORESERVEDCONSTANTS 0x10u
+
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
     float ax = (float)g_target_aa_x, ay = (float)g_target_aa_y;
@@ -761,7 +802,8 @@ static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
     float scale[4]  = { half_w, -half_h, g_z_scale, 1.0f };
     float offset[4] = { half_w, half_h, 0.0f, 0.0f };
 
-    host_vsh_set_constant(58, reserved, 2);
+    if (!(g_shader_constant_mode & X_D3DSCM_NORESERVEDCONSTANTS))
+        host_vsh_set_constant(58, reserved, 2);
     host_vsh_set_screenspace(scale, offset);
 }
 

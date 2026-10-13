@@ -287,7 +287,8 @@ static uint8_t *push_gather_from(const uint32_t off[16], const uint32_t fmt[16],
  * the NV2A would have loaded by the time it reached the draw, whoever wrote
  * the commands -- the XDK's own SetVertexShaderConstant writes are in there
  * too, and replaying them again in order changes nothing. The viewport pair
- * (58, 59) is left to shadow mode, which keeps its own. Anything that is not
+ * (58, 59) is left to shadow mode, which keeps its own, while the title has
+ * not freed it (X_D3DSCM_NORESERVEDCONSTANTS). Anything that is not
  * a command header ends the walk and resynchronises at the put pointer.
  * RECOMP_HLE_D3D8_PB_CONSTANTS=0 turns it off.
  * ------------------------------------------------------------------------ */
@@ -314,9 +315,16 @@ static void pb_flush(void)
     g_pb_run_count = 0;
 }
 
+int hle_d3d8_reserved_constants_free(void);   /* hle_d3d8.c */
+
 static void pb_constant(uint32_t reg, const float v[4])
 {
-    if (reg >= MAX_CONSTANT_REGISTERS || reg == 58u || reg == 59u) {
+    /* 58 and 59 are the viewport, shadow mode's own -- unless the title has
+     * taken them (X_D3DSCM_NORESERVEDCONSTANTS): Gladius puts two rows of a
+     * skinning bone there, and dropped, every vertex on that bone was
+     * transformed by the viewport instead. */
+    if (reg >= MAX_CONSTANT_REGISTERS ||
+        ((reg == 58u || reg == 59u) && !hle_d3d8_reserved_constants_free())) {
         pb_flush();
         return;
     }
