@@ -4157,6 +4157,43 @@ static uint32_t push_vertex_stride(void)
     return fvf_stride(g_shadow_vs);
 }
 
+/* NV097_SET_VERTEX_DATA4UB (0x1940 + 4r), _2F_M (0x1880 + 8r) and _4F_M
+ * (0x1A00 + 16r) outside a begin/end: the register's current value, for the
+ * draws that follow. Gladius draws its menu backdrop as a push of its own --
+ * 4UB colour into v3, then a quad of positions only -- and the colour method
+ * stopped the walk, so the backdrop was never drawn. 4UB is x in the low
+ * byte, as the XDK's SetVertexDataColor writes it. Whether the method was
+ * one of these. */
+static int push_vertex_constant(uint32_t method, uint32_t va, uint32_t count)
+{
+    float v[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t reg, k;
+
+    if (method >= 0x1940u && method < 0x1980u && count == 1u) {
+        uint32_t c = HLE_MEM32(va);
+        reg = (method - 0x1940u) / 4u;
+        for (k = 0; k < 4u; k++)
+            v[k] = (float)((c >> (8u * k)) & 0xFFu) / 255.0f;
+    } else if (method >= 0x1880u && method < 0x1900u && count == 2u && !(method & 7u)) {
+        reg = (method - 0x1880u) / 8u;
+        for (k = 0; k < 2u; k++) {
+            uint32_t w = HLE_MEM32(va + 4u * k);
+            memcpy(&v[k], &w, 4);
+        }
+    } else if (method >= 0x1A00u && method < 0x1B00u && count == 4u && !(method & 15u)) {
+        reg = (method - 0x1A00u) / 16u;
+        for (k = 0; k < 4u; k++) {
+            uint32_t w = HLE_MEM32(va + 4u * k);
+            memcpy(&v[k], &w, 4);
+        }
+    } else {
+        return 0;
+    }
+    if (g_shadow)
+        host_vsh_set_vertex_data((int)reg, v);
+    return 1;
+}
+
 static void push_replay(uint32_t start, uint32_t end)
 {
     static uint32_t *data;
@@ -4212,6 +4249,9 @@ static void push_replay(uint32_t start, uint32_t end)
             n += count;
         } else if (method >= NV2A_PUSH_ARRAYS_FIRST && method < NV2A_PUSH_ARRAYS_END) {
             /* The title's vertex arrays: hle_d3d8_push_arrays_scan has them. */
+        } else if (!prim && push_vertex_constant(method, va, count)) {
+            /* A register's current value, as SetVertexDataColor/2f/4f set
+             * it: what the inline array's vertices do not carry. */
         } else {
             static uint32_t said[8];
             int s;
@@ -4223,6 +4263,14 @@ static void push_replay(uint32_t start, uint32_t end)
                 fprintf(stderr, "[HLE-D3D8] push buffer: method 0x%04X (count %u) "
                         "written by the title is not replayed; its push is skipped "
                         "from there\n", method, count);
+                /* RECOMP_HLE_D3D8_PUSH_DUMP=1: that push, word by word, so
+                 * what the title draws this way can be read. */
+                if (xbox_EnvSwitch("RECOMP_HLE_D3D8_PUSH_DUMP", 0)) {
+                    uint32_t w;
+                    for (w = start; w < end && w < start + 4u * 160u; w += 4u)
+                        fprintf(stderr, "[HLE-D3D8]   push +%03X: %08X\n",
+                                w - start, HLE_MEM32(w));
+                }
             }
             g_push_other++;
             return;
