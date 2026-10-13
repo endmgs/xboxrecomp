@@ -7,6 +7,11 @@ copies means a template fix has to be applied by hand to each; this applies it.
 
     py -3 scripts/regen_title_main.py burnout2 "Burnout 2" 0x000E2555 "Burnout 2 - Point of Impact"
 
+A fifth argument names the image to boot when it is not default.xbe (a disc
+whose default.xbe is only a language picker, like Gladius's):
+
+    py -3 scripts/regen_title_main.py gladius Gladius 0x0015B2A7 Gladius gladius_eng.xbe
+
 Or every title at once, each keeping the name, entry point and game folder its
 current main.c already has:
 
@@ -25,7 +30,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 BS = chr(92)
 
 
-def render(name, entry, game_folder):
+def render(name, entry, game_folder, xbe_name="default.xbe"):
     rel = BS.join(["..", "..", "..", "..", "games", game_folder])
     c_rel = rel.replace(BS, BS + BS)            # as it appears inside a C string
     lines = (REPO / "templates" / "new-game" / "src" / "main.c").read_text(
@@ -42,27 +47,32 @@ def render(name, entry, game_folder):
             out.append(" * which is where scripts/run_and_report.py starts it. "
                        "Run it from there by")
             out.append(" * hand too, or the XBE is not found. */")
-            line = '#define YOUR_GAME_XBE_PATH      "%s%s%sdefault.xbe"' % (c_rel, BS, BS)
+            line = '#define YOUR_GAME_XBE_PATH      "%s%s%s%s"' % (c_rel, BS, BS, xbe_name)
             replaced.add("xbe")
+        elif line.startswith("#define YOUR_GAME_XBE_NAME"):
+            line = '#define YOUR_GAME_XBE_NAME       "%s"' % xbe_name
+            replaced.add("name")
         elif line.startswith("#define YOUR_GAME_DIR"):
             line = '#define YOUR_GAME_DIR            "%s"' % c_rel
             replaced.add("dir")
         out.append(line.replace("YOUR_GAME_NAME", name))
-    if replaced != {"entry", "xbe", "dir"}:
+    if replaced != {"entry", "xbe", "dir", "name"}:
         raise SystemExit("template layout changed; defines not found: %s" % replaced)
     return "\n".join(out)
 
 
 def current_values(main_c):
-    """The banner name, entry point and game folder an existing main.c has."""
+    """The banner name, entry point, game folder and XBE an existing main.c has."""
     s = main_c.read_text(encoding="utf-8")
     m_name = re.search(r"/\*\*\n \* (.*?) - Recompiled", s)
     m_entry = re.search(r"#define YOUR_GAME_ENTRY_POINT\s+(\S+)", s)
     m_dir = re.search(r'#define YOUR_GAME_DIR\s+"([^"]*)"', s)
     if not (m_name and m_entry and m_dir):
         return None
+    m_xbe = re.search(r'#define YOUR_GAME_XBE_NAME\s+"([^"]*)"', s)
     folder = m_dir.group(1).replace(BS + BS, BS).split(BS)[-1]
-    return m_name.group(1), m_entry.group(1), folder
+    return (m_name.group(1), m_entry.group(1), folder,
+            m_xbe.group(1) if m_xbe else "default.xbe")
 
 
 def write(title_dir, text):
@@ -89,11 +99,11 @@ def main(argv):
                 continue
             write(d.name, render(*values))
         return 1 if failed else 0
-    if len(argv) != 5:
+    if len(argv) not in (5, 6):
         print(__doc__)
         return 2
-    title_dir, name, entry, game_folder = argv[1:]
-    write(title_dir, render(name, entry, game_folder))
+    title_dir, name, entry, game_folder = argv[1:5]
+    write(title_dir, render(name, entry, game_folder, *argv[5:]))
     return 0
 
 

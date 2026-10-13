@@ -99,7 +99,7 @@ def main(argv=None):
 
     rc = subprocess.call([sys.executable, str(ROOT / "scripts" / "regen_title_main.py"),
                           args.name, args.game_folder, "0x%08X" % entry,
-                          args.game_folder])
+                          args.game_folder, xbe.name])
     if rc != 0:
         print("error: regen_title_main failed", file=sys.stderr)
         return rc
