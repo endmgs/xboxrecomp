@@ -772,9 +772,10 @@ static float xbox_depth_z_scale(uint32_t format)
 /* The multisample factors of the screen surface being drawn into, 1x1 for
  * any other target (shadow_set_render_target).
  *
- * The NV2A rasterises a multisampled screen at the surface's own size, and
- * the XDK's viewport constants are in those pixels: the viewport scaled by
- * the factors. Gladius (1x2, a 640x960 screen for its 640x480 device) works
+ * For a supersample type (g_multisample_type) the NV2A rasterises the
+ * screen at the surface's own size, and the XDK's viewport constants are in
+ * those pixels: the viewport scaled by the factors. A multisample type keeps
+ * the device's pixels, so nothing is scaled for it. Gladius (1x2, a 640x960 screen for its 640x480 device) works
  * its programs' screen space out itself and arrives at the XDK's numbers --
  * scale 320, 480, offset 320.53, 480.53 -- and with the undo in the device's
  * 640x480 every program draw came out at twice its height: the menus below
@@ -784,12 +785,24 @@ static float xbox_depth_z_scale(uint32_t format)
  * cancels for a title that uses the reserved constants. */
 static UINT g_target_aa_x = 1, g_target_aa_y = 1;
 
+/* D3DPRESENT_PARAMETERS.MultiSampleType from CreateDevice. A supersample
+ * type (0x2000 set: 0x2012 vertical, 0x2011 horizontal, 0x2022 ...) renders
+ * the picture at the surface's size, and screen space is in its pixels; a
+ * multisample type (0x1000: 0x1011, 0x1021 ...) takes extra samples of a
+ * picture still rasterised in the device's pixels. Gladius is 0x2012 and
+ * hands its programs surface pixels; Need for Speed Underground 2 is 0x1021
+ * and hands them device pixels, so with its viewport scaled its menus came
+ * out in the left half of the screen. */
+static uint32_t g_multisample_type;
+#define X_D3DMULTISAMPLE_SUPERSAMPLE 0x2000u
+
 /* D3DDevice_SetShaderConstantMode's last mode is g_shader_constant_mode. */
 #define X_D3DSCM_NORESERVEDCONSTANTS 0x10u
 
 static void shadow_viewport_constants(const D3DVIEWPORT8 *vp)
 {
-    float ax = (float)g_target_aa_x, ay = (float)g_target_aa_y;
+    int super = (g_multisample_type & X_D3DMULTISAMPLE_SUPERSAMPLE) != 0;
+    float ax = super ? (float)g_target_aa_x : 1.0f, ay = super ? (float)g_target_aa_y : 1.0f;
     float half_w = (float)g_target_width / 2.0f * ax;
     float half_h = (float)g_target_height / 2.0f * ay;
     float reserved[8] = {
@@ -2278,6 +2291,7 @@ HLE_EXPORT(Direct3D_CreateDevice)
          * Flags +0x28, FullScreen_PresentationInterval +0x30. The swap effect
          * decides what a Swap means (frame_end_shadow). */
         g_swap_effect = HLE_MEM32(pp_va + 0x14);
+        g_multisample_type = HLE_MEM32(pp_va + 0x10);
         /* The flip that would have waited for it is on a GPU that is not
          * there; the flip gate keeps the title's cadence instead. */
         if ((int32_t)g_eax >= 0)
