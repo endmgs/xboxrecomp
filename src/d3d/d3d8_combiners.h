@@ -331,7 +331,21 @@ typedef struct NV2APSConstants {
     UINT  shadow_func;
     UINT  shadow_swap;
     UINT  shadow_pad[2];
+    /* What the fog register's alpha is, with fog on (NV2A_FOG_SRC_*), and
+     * the range it is mapped through: start, end, density, D3DFOGMODE. */
+    float fog_params[4];
+    UINT  fog_src;
+    UINT  fog_range;                        /* range fog: |distance| */
+    UINT  fog_pad[2];
 } NV2APSConstants;
+
+/* NV2APSConstants.fog_src. The fog unit sits before the combiners, so their
+ * fog alpha is the factor it produced -- from the vertex stage's fog output
+ * as it is only when that output already is a factor. */
+#define NV2A_FOG_SRC_FACTOR        0u  /* fog off, or fixed-function vertex fog */
+#define NV2A_FOG_SRC_PROGRAM_TABLE 1u  /* program oFog is the distance; table mode */
+#define NV2A_FOG_SRC_VIEW_TABLE    2u  /* fixed function, table fog from view depth */
+#define NV2A_FOG_SRC_PROGRAM       3u  /* program oFog, linear through start..end */
 
 /* ================================================================
  * Public API

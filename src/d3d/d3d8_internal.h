@@ -372,6 +372,9 @@ void    d3d8_shaders_shutdown(void);
 
 /* Select programmable/FVF vertex state and refresh fixed-function pixel state. */
 void    d3d8_shaders_prepare_draw(DWORD handle);
+/* Whether the draw d3d8_shaders_prepare_draw last prepared runs a vertex
+ * program (its oFog is then a fog coordinate, not a factor). */
+int     d3d8_shaders_draw_is_program(void);
 
 /* ================================================================
  * NV2A Register Combiner pixel shaders (d3d8_combiners.c)

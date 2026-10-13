@@ -1173,6 +1173,11 @@ static void ff_vs_prepare_draw(DWORD fvf)
  * a fog coordinate rather than a factor (program_fog above). */
 static int g_draw_is_program;
 
+int d3d8_shaders_draw_is_program(void)
+{
+    return g_draw_is_program;
+}
+
 /* Whether a texture-stage operation reads D3DTA_TEXTURE (base 2) through
  * one of the arguments it uses. */
 static int ff_op_reads_texture(DWORD op, DWORD arg1, DWORD arg2)

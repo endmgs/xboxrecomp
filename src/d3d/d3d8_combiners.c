@@ -851,6 +851,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 tex_scale[4];\n");   /* texel -> normalised, linear textures */
     EMIT("    float4 shadow_max;\n");     /* per stage: the depth format's top */
     EMIT("    uint4  shadow_func;\n");    /* x: D3DCMPFUNC, y: compare reversed */
+    EMIT("    float4 fog_params;\n");     /* start, end, density, D3DFOGMODE */
+    EMIT("    uint4  fog_src;\n");        /* x: NV2A_FOG_SRC_*, y: range fog */
     EMIT("};\n\n");
 
     /* ---- Input structure ----
@@ -881,7 +883,28 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * interpolated, which both vertex paths write to TEXCOORD4
      * (d3d8_shaders.c for fixed function, d3d8_vsh.c for a program). */
     EMIT("    float  fog     : TEXCOORD4;\n");
+    EMIT("    float4 viewpos : TEXCOORD5;\n");
     EMIT("};\n\n");
+
+    /* The fog unit, which runs before the combiners: the factor their fog
+     * register's alpha holds. d3d8_shaders.c's compute_pfog and program_fog
+     * do the same for the fixed-function pixel path. */
+    EMIT("float fog_factor(PS_IN input) {\n");
+    EMIT("    if (fog_src.x == 0u) return saturate(input.fog);\n");
+    EMIT("    float d = input.fog;\n");
+    EMIT("    if (fog_src.x == 2u) d = fog_src.y ? length(input.viewpos.xyz) : -input.viewpos.z;\n");
+    EMIT("    else if (fog_src.y) d = abs(d);\n");
+    EMIT("    uint mode = fog_src.x == 3u ? 3u : (uint)fog_params.w;\n");
+    EMIT("    if (mode == 1u) return saturate(exp(-fog_params.z * d));\n");
+    EMIT("    if (mode == 2u) { float e = fog_params.z * d; return saturate(exp(-e * e)); }\n");
+    EMIT("    if (mode == 3u) {\n");
+    EMIT("        float span = fog_params.y - fog_params.x;\n");
+    EMIT("        if (span == 0.0 || isinf(d)) return 1.0;\n");
+    EMIT("        float f = (fog_params.y - d) / span;\n");
+    EMIT("        return isnan(f) ? 1.0 : saturate(f);\n");
+    EMIT("    }\n");
+    EMIT("    return 1.0;\n");
+    EMIT("}\n\n");
 
     /* ---- Shadow compare ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES && !state->shadow[i]; i++)
@@ -945,7 +968,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * factor, computed in its vertex programs (A = fog alpha, B = fog
      * colour, C = r0), so with 1 forced here its guns, hands and cave came
      * out the flat fog colour. */
-    EMIT("    float4 r_fog  = float4(fog_color.rgb, saturate(input.fog));\n");
+    /* With fog on, the factor is the fog unit's (fog_factor): under a vertex
+     * program the interpolated value is the program's fog coordinate, a
+     * distance, and Gladius's skinned characters (oFog = -32 or so, table
+     * fog from 25 to 325) came out the flat fog colour when it was read as
+     * the factor. */
+    EMIT("    float4 r_fog  = float4(fog_color.rgb, fog_factor(input));\n");
 
     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
      * should have already swizzled to RGBA. */
@@ -1569,6 +1597,22 @@ BOOL d3d8_combiners_prepare_draw(void)
         cb->alpha_func = rs[D3DRS_ALPHAFUNC];
         cb->alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] ? 1 : 0;
         cb->fog_enable = rs[D3DRS_FOGENABLE] ? 1 : 0;
+        cb->fog_src = NV2A_FOG_SRC_FACTOR;
+        cb->fog_range = 0;
+        memset(cb->fog_pad, 0, sizeof cb->fog_pad);
+        memset(cb->fog_params, 0, sizeof cb->fog_params);
+        if (rs[D3DRS_FOGENABLE]) {
+            int program = d3d8_shaders_draw_is_program();
+            memcpy(&cb->fog_params[0], &rs[D3DRS_FOGSTART], sizeof(float));
+            memcpy(&cb->fog_params[1], &rs[D3DRS_FOGEND], sizeof(float));
+            memcpy(&cb->fog_params[2], &rs[D3DRS_FOGDENSITY], sizeof(float));
+            cb->fog_params[3] = (float)rs[D3DRS_FOGTABLEMODE];
+            cb->fog_range = rs[D3DRS_RANGEFOGENABLE] ? 1 : 0;
+            if (rs[D3DRS_FOGTABLEMODE] != D3DFOG_NONE)
+                cb->fog_src = program ? NV2A_FOG_SRC_PROGRAM_TABLE : NV2A_FOG_SRC_VIEW_TABLE;
+            else if (program)
+                cb->fog_src = NV2A_FOG_SRC_PROGRAM;
+        }
         for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
             IDirect3DBaseTexture8 *tex = d3d8_GetStageTexture(i);
             D3DFORMAT format = d3d8_base_format(tex);
