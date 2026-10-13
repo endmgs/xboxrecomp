@@ -40,6 +40,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+
+def config_file(args, kind, title):
+    """config/<kind>/<TITLEID>.json: the title project's own, when --project
+    names one that has it (a title kept in a repository of its own carries its
+    seeds and sections with it), else the toolkit's."""
+    if getattr(args, "project", None):
+        own = Path(args.project).resolve() / "config" / kind / (title + ".json")
+        if own.is_file():
+            return own
+    return REPO / "config" / kind / (title + ".json")
+
+
 def xbe_title_id(xbe):
     """The title ID from an XBE certificate, as eight uppercase hex digits.
 
@@ -288,7 +300,7 @@ def main() -> int:
         args.seeds = []
         title = xbe_title_id(xbe)
         if title:
-            per_title = REPO / "config" / "seeds" / (title + ".json")
+            per_title = config_file(args, "seeds", title)
             if per_title.is_file():
                 args.seeds = [per_title]
                 if args.verbose:
@@ -305,7 +317,7 @@ def main() -> int:
     # is data in one game (MDL*, MAP*) may be code in another.
     args.data_sections = []
     title = xbe_title_id(xbe)
-    sec_file = REPO / "config" / "sections" / ((title or "") + ".json")
+    sec_file = config_file(args, "sections", title or "")
     if title and sec_file.is_file():
         entries = json.loads(sec_file.read_text(encoding="utf-8")).get("data", [])
         args.data_sections = [e["pattern"] for e in entries]
