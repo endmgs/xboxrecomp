@@ -534,3 +534,42 @@ void sub_001BBD60(void)
                     "screen of %u pixels' width; frame stays %ux%u\n", w, h_eff, w, w, h);
     fflush(stderr);
 }
+
+/* RECOMP_GLADIUS_CLOCK=1: every five seconds, how far the game's own clock
+ * (the float sub_001FC860 adds each frame's time to, 0x00502468) moved
+ * against the wall clock and the frames presented. A clock-driven game moves
+ * it one second a second at any frame rate. */
+extern void sub_001FC860_gen(void);
+uint64_t xbox_ReadTimeStampCounter(void);
+
+void sub_001FC860(void)
+{
+    static int on = -1;
+    static uint64_t t0;
+    static float g0;
+    static unsigned long frames;
+
+    sub_001FC860_gen();
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_GLADIUS_CLOCK", 0);
+    if (!on)
+        return;
+    {
+        uint64_t now = xbox_ReadTimeStampCounter();
+        float g = *(volatile float *)((uintptr_t)0x00502468u + g_xbox_mem_offset);
+        frames++;
+        if (!t0) {
+            t0 = now;
+            g0 = g;
+            frames = 0;
+        } else if (now - t0 >= 5ull * 733333333ull) {
+            double wall = (double)(now - t0) / 733333333.0;
+            fprintf(stderr, "[GLADIUS] clock: %.2f s of game time in %.2f s, %lu frames "
+                            "(%.1f fps)\n", (double)(g - g0), wall, frames, frames / wall);
+            fflush(stderr);
+            t0 = now;
+            g0 = g;
+            frames = 0;
+        }
+    }
+}
