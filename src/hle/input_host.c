@@ -122,11 +122,18 @@ static void fake_apply(RecompInputGamepad *g, int i)
  * is how a run gets back to the same screen. The sequence is the save state.
  * Nothing is pressed after the last step ends.
  *
- * SEQ_MAX was 128, and a longer script was cut short in silence: a six-minute
- * MK Shaolin Monks play test stopped pressing at three minutes and looked like
- * the game had stopped answering the pad. A script cut short now says so. */
-#define SEQ_MAX 1024
-static struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; } s_seq[SEQ_MAX];
+ * There is no step limit. SEQ_MAX was 128, and a longer script was cut short
+ * in silence: a six-minute MK Shaolin Monks play test stopped pressing at
+ * three minutes and looked like the game had stopped answering the pad. At
+ * 1024 a recorded play session (RECOMP_INPUT_RECORD below) still did: six and
+ * a half minutes of TimeSplitters 2 is 1250 steps. The array grows instead.
+ *
+ * RECOMP_INPUT_SEQ_FILE=<path> reads the script from a file (the format
+ * RECOMP_INPUT_RECORD writes), for a script too long to want in the
+ * environment; RECOMP_INPUT_SEQ wins when both are set. */
+struct seq_step { unsigned long at, hold; int keys[4]; int nkeys; };
+static struct seq_step *s_seq;
+static int s_seq_cap;
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
 
@@ -134,13 +141,25 @@ static void seq_parse(const char *env)
 {
     const char *p = env;
 
-    while (*p && s_seq_count < SEQ_MAX) {
-        struct seq_step *s = &s_seq[s_seq_count];
+    while (*p) {
+        struct seq_step *s;
         char *end;
         const char *step_end = strchr(p, ',');
         size_t len = step_end ? (size_t)(step_end - p) : strlen(p);
         const char *q;
 
+        if (s_seq_count == s_seq_cap) {
+            int cap = s_seq_cap ? s_seq_cap * 2 : 256;
+            struct seq_step *grown = (struct seq_step *)realloc(s_seq, (size_t)cap * sizeof *grown);
+            if (!grown) {
+                fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: out of memory after %d steps;"
+                        " the rest are ignored\n", s_seq_count);
+                return;
+            }
+            s_seq = grown;
+            s_seq_cap = cap;
+        }
+        s = &s_seq[s_seq_count];
         memset(s, 0, sizeof *s);
         s->hold = 200;
         s->at = strtoul(p, &end, 10);
@@ -179,9 +198,39 @@ static void seq_parse(const char *env)
         }
         p = step_end + 1;
     }
-    if (*p && s_seq_count >= SEQ_MAX)
-        fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ: more than %d steps; the rest are ignored"
-                " (from '%.24s')\n", SEQ_MAX, p);
+}
+
+/* The whole of a script file, line breaks and spaces dropped (a recording is
+ * one line, but an edited one need not be); NULL if it cannot be read. */
+static char *seq_read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char *text = NULL;
+    size_t len = 0, cap = 0;
+    int c;
+
+    if (!f)
+        return NULL;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            continue;
+        if (len + 1 >= cap) {
+            size_t ncap = cap ? cap * 2 : 4096;
+            char *grown = (char *)realloc(text, ncap);
+            if (!grown) {
+                free(text);
+                fclose(f);
+                return NULL;
+            }
+            text = grown;
+            cap = ncap;
+        }
+        text[len++] = (char)c;
+    }
+    fclose(f);
+    if (text)
+        text[len] = 0;
+    return text;
 }
 
 /* Whether an input script is driving this run (RECOMP_INPUT_SEQ), parsing
@@ -190,12 +239,24 @@ static int seq_active(void)
 {
     if (s_seq_count < 0) {
         const char *env = getenv("RECOMP_INPUT_SEQ");
+        const char *path = getenv("RECOMP_INPUT_SEQ_FILE");
+        char *file = NULL;
         s_seq_count = 0;
+        if ((!env || !*env) && path && *path) {
+            file = seq_read_file(path);
+            if (!file)
+                fprintf(stderr, "  [PAD] RECOMP_INPUT_SEQ_FILE=%s: cannot read it\n", path);
+            env = file;
+        }
         if (env && *env) {
             seq_parse(env);
-            fprintf(stderr, "  [PAD] input script: %d steps from %s\n", s_seq_count, env);
+            /* The start, not the whole: a recorded session is tens of KB. */
+            fprintf(stderr, "  [PAD] input script: %d steps, from %s, starting %.80s%s\n",
+                    s_seq_count, file ? path : "RECOMP_INPUT_SEQ", env,
+                    strlen(env) > 80 ? "..." : "");
             fflush(stderr);
         }
+        free(file);
     }
     return s_seq_count > 0;
 }

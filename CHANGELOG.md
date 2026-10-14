@@ -11,6 +11,14 @@ For where each title stands today, see the [README](README.md#title-status).
 
 ## October 2026
 
+### Input scripts without a step limit (branch `feat/ts2-decomp`, 14 Oct)
+- `RECOMP_INPUT_SEQ` no longer stops at 1024 steps: the array grows. A recorded play session
+  (`RECOMP_INPUT_RECORD`) of six and a half minutes of TimeSplitters 2 was 1250 steps, and its
+  replay stopped pressing partway through.
+- `RECOMP_INPUT_SEQ_FILE=<path>` reads a script from a file, in the format `RECOMP_INPUT_RECORD`
+  writes, for scripts too long to want in the environment. `RECOMP_INPUT_SEQ` wins when both are set.
+- The start-up line names where the script came from and shows its first 80 characters, not all of it.
+
 ### macOS on Apple Silicon (#49, 7 Oct)
 TimeSplitters 2 and BLiNX run on an M-series Mac at 60 fps with sound.
 
