@@ -1309,14 +1309,25 @@ HLE_EXPORT(IDirectSoundStream_SetOutputBuffer)
 }
 
 /* SetEG(this, pEnvelopeDesc): DSENVELOPEDESC's ten DWORDs, the first saying
- * which envelope (0 amplitude, 1 multi). hle_dsound.c runs them. */
+ * which envelope: DSEG_AMPLITUDE is 1 and DSEG_MULTI is 0. Stored here as
+ * [0] amplitude, [1] multi, which is how hle_dsound.c runs them.
+ *
+ * The XDK's own CMcpxVoiceClient_SetEG says so: its dwEG == 0 branch is the
+ * only one that reads lPitchScale and lFilterCutOff (+0x20, +0x24), which
+ * only the multi envelope has, and any other value stores nothing. This was
+ * read the other way round, and a title that sets both (TimeSplitters 2, for
+ * every sound effect: amplitude sustain 255, multi all 0) had its multi
+ * envelope applied as the volume -- every effect sample times 0. */
 static void envelope(uint32_t key, uint32_t p)
 {
     Voice *v;
-    uint32_t k, which;
+    uint32_t k, which, eg;
     if (!p || !guest_readable(p, 40u))
         return;
-    which = HLE_MEM32(p) & 1u;
+    eg = HLE_MEM32(p);
+    if (eg > 1u)
+        return;
+    which = eg == 1u ? 0u : 1u;
     lock();
     v = get(key);
     if (v) {

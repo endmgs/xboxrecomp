@@ -32,8 +32,9 @@ uint32_t hle_ds3d_mixins(uint32_t *keys, uint32_t max);
  * hands a changed I3DL2 room (SetI3DL2Listener) to the host's reverb. */
 void hle_ds3d_service(void);
 
-/* SetEG's DSENVELOPEDESC (which: 0 amplitude, 1 multi), as the title last
- * gave it for this voice; returns 0 if it never did. `out` is the ten
+/* SetEG's DSENVELOPEDESC (which: 0 amplitude, 1 multi -- this file's
+ * numbering, not DSENVELOPEDESC.dwEG's, where amplitude is 1), as the title
+ * last gave it for this voice; returns 0 if it never did. `out` is the ten
  * DWORDs of the structure. */
 int hle_ds3d_envelope(uint32_t voice, uint32_t which, uint32_t out[10]);
 
