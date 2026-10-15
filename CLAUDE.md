@@ -424,6 +424,16 @@ py -3 scripts/recompile.py "games/<title>/default.xbe" \
     --work-dir games/_pipeline/<name>/out --project titles/<name>
 ```
 
+**XBE patches (Oct 2026):** when a title's fixed-size table has to grow, the change goes into
+the image *before* the lift, because lifted code has its addresses and counts compiled in.
+`--xbe-patches <file>` (default `config/xbe_patches/<TITLEID>.json`) adds sections, copies
+tables into them and patches same-length operands, each checked against the bytes it replaces;
+every stage reads a patched copy in `<work-dir>/xbe_patched/` (never the player's file), and the
+lift links `recomp_xbe_patches.c` so `xbox_MemoryLayoutInit` patches the unpatched
+`default.xbe` the same way, SHA-1-checked, before mapping it. No patch file, byte-identical
+output. Format and rules: `docs/technical/xbe-patches.md`; `py -3 -m tools.xbe_patch check`
+tries a file out.
+
 Add `--trace-all-entries` only while bringing a title up: it puts a hook at every lifted
 function's entry (for `[TRACE]` lines, `RECOMP_TRACE_ONLY`, the entry profiler and the
 "main thread stops entering new functions" diagnosis) and costs a few percent of frame

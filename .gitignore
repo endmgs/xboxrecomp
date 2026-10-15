@@ -8,6 +8,7 @@ tools/disasm/output/
 tools/func_id/output/
 tools/recomp/output/
 tools/abi_analysis/output/
+tools/xbe_patch/output/
 tools/regression-results
 
 

@@ -32,6 +32,7 @@ project, or the second title silently lifts from the first one's disassembly
 """
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -78,8 +79,53 @@ def xbe_title_id(xbe):
 STAGES = ["parse", "disasm", "identify", "lift"]
 
 
-def build_commands(args, xbe: Path, analysis_json: Path):
-    """Return [(stage, argv)] for the stages that were selected."""
+def prepare_patched_xbe(xbe: Path, patch_file: Path, out_dir: Path,
+                        data_sections) -> Path:
+    """Write the patched copy of the title's XBE the stages read, and return
+    its path. Only rewritten when its bytes change. The title's own XBE is
+    only read (docs/technical/xbe-patches.md)."""
+    sys.path.insert(0, str(REPO))
+    from tools.xbe_patch import PatchError, apply_patches, load_spec
+    try:
+        spec = load_spec(patch_file)
+        patched, log = apply_patches(xbe.read_bytes(), spec, data_sections,
+                                     name=patch_file.name)
+    except PatchError as e:
+        raise SystemExit(f"error: {e}")
+    out = out_dir / xbe.name
+    if out.resolve() == xbe.resolve():
+        raise SystemExit(f"error: the patched XBE would overwrite {xbe}")
+    print(f"XBE patches {patch_file}")
+    for line in log:
+        print(f"           {line}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not out.is_file() or out.read_bytes() != patched:
+        out.write_bytes(patched)
+    return out
+
+
+def image_stamp_path(args) -> Path:
+    """Beside the disassembly: which image the stage outputs were made from."""
+    if args.work_dir:
+        return Path(args.work_dir).resolve() / "disasm" / "image.json"
+    return REPO / "tools" / "disasm" / "output" / "image.json"
+
+
+def image_id(stage_xbe: Path, patch_file) -> dict:
+    return {"xbe_sha1": hashlib.sha1(stage_xbe.read_bytes()).hexdigest(),
+            "patches": str(patch_file) if patch_file else None}
+
+
+def build_commands(args, xbe: Path, analysis_json: Path, stage_xbe: Path = None):
+    """Return [(stage, argv)] for the stages that were selected.
+
+    stage_xbe is the image the stages read: the patched copy when the title
+    has an XBE patch file (docs/technical/xbe-patches.md), else xbe itself.
+    Files kept beside the title's XBE (its XDK symbols) are still looked for
+    beside xbe."""
+    original = xbe
+    patched = stage_xbe is not None and Path(stage_xbe) != Path(xbe)
+    xbe = Path(stage_xbe) if stage_xbe is not None else xbe
     parse = [sys.executable, "-m", "tools.xbe_parser", str(xbe),
              "--json", str(analysis_json)]
 
@@ -95,6 +141,9 @@ def build_commands(args, xbe: Path, analysis_json: Path):
     # The extra sections are a few hundred KB against a 2 MB .text, so the
     # scan costs little; --text-only trades correctness for a few seconds.
     disasm = [sys.executable, "-m", "tools.disasm", str(xbe)]
+    if patched:
+        # Not left to auto-detection, which looks beside the XBE only.
+        disasm += ["--analysis-json", str(analysis_json)]
     if args.text_only:
         disasm.append("--text-only")
     # Every stage defaults to one shared tools/*/output directory, and the
@@ -162,9 +211,13 @@ def build_commands(args, xbe: Path, analysis_json: Path):
         lift.append("--trace-all-entries")
     # XDK functions with a name-keyed replacement (tools/recomp/hle.py), used
     # whenever tools.xdk_symbols has been run for this XBE.
-    hle_symbols = xbe.with_name(xbe.stem + "_xdk_symbols.json")
+    hle_symbols = original.with_name(original.stem + "_xdk_symbols.json")
     if hle_symbols.exists():
         lift += ["--hle-symbols", str(hle_symbols)]
+    # The lift writes the runtime's copy of the patches (recomp_xbe_patches.c)
+    # from the difference between the two; without this it removes a stale one.
+    if patched:
+        lift += ["--xbe-original", str(original)]
     if args.verbose:
         lift.append("-v")
 
@@ -213,6 +266,15 @@ def main() -> int:
                          "disables it.")
     ap.add_argument("--no-seeds", action="store_true",
                     help="Ignore this title's seed file")
+    ap.add_argument("--xbe-patches", metavar="FILE",
+                    help="XBE patch file (docs/technical/xbe-patches.md): the "
+                         "stages read a patched copy of the XBE, written to "
+                         "<work-dir>/xbe_patched/, and the lift links the same "
+                         "patches into the title for the runtime. Defaults to "
+                         "config/xbe_patches/<TITLEID>.json (the project's, "
+                         "else the toolkit's) when one exists")
+    ap.add_argument("--no-xbe-patches", action="store_true",
+                    help="Ignore this title's XBE patch file")
     ap.add_argument("--trace-all-entries", action="store_true",
                     help="Hook every function's entry so a profiled run can "
                          "report how many distinct functions it reached. That "
@@ -327,12 +389,58 @@ def main() -> int:
         print(f"error: XBE not found: {xbe}", file=sys.stderr)
         return 1
 
-    # Written next to the XBE, named after it, because tools.disasm looks
-    # there first and several titles may share one directory.
-    analysis_json = (Path(args.json).resolve() if args.json
-                     else xbe.parent / f"{xbe.stem}_analysis.json")
+    # XBE patches: the stages read a patched copy, never the title's file.
+    patch_file = None
+    if args.xbe_patches and not args.no_xbe_patches:
+        patch_file = Path(args.xbe_patches).resolve()
+        if not patch_file.is_file():
+            print(f"error: XBE patch file not found: {patch_file}", file=sys.stderr)
+            return 1
+    elif not args.no_xbe_patches and title:
+        found = config_file(args, "xbe_patches", title)
+        if found.is_file():
+            patch_file = found
+    stage_xbe = xbe
+    if patch_file:
+        out_dir = (Path(args.work_dir).resolve() / "xbe_patched" if args.work_dir
+                   else REPO / "tools" / "xbe_patch" / "output")
+        stage_xbe = (out_dir / xbe.name if args.dry_run else
+                     prepare_patched_xbe(xbe, patch_file, out_dir,
+                                         args.data_sections))
 
-    commands = build_commands(args, xbe, analysis_json)
+    # Written next to the XBE, named after it, because tools.disasm looks
+    # there first and several titles may share one directory. A patched
+    # image's goes beside the patched copy: it describes that image.
+    analysis_json = (Path(args.json).resolve() if args.json
+                     else stage_xbe.parent / f"{stage_xbe.stem}_analysis.json")
+
+    # The stage outputs belong to one image. Starting part-way through with
+    # another -- a changed patch file, or none where there was one -- would
+    # lift the new image with the old disassembly, so go back to the start.
+    stamp_path = image_stamp_path(args)
+    current = None if args.dry_run else image_id(stage_xbe, patch_file)
+    first = args.only or args.start
+    if current and first != "parse" and stamp_path.is_file():
+        try:
+            recorded = json.loads(stamp_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {}
+        if recorded.get("xbe_sha1") != current["xbe_sha1"]:
+            why = ("the XBE patches changed" if patch_file or recorded.get("patches")
+                   else "the XBE changed")
+            if args.only:
+                print(f"error: {why} since the stage outputs were made; run "
+                      f"from parse, not --only {args.only}", file=sys.stderr)
+                return 1
+            print(f"{why} since the stage outputs were made: starting from "
+                  f"parse, not {args.start}")
+            args.start = "parse"
+    elif current and first != "parse" and patch_file:
+        print(f"no record of which image the stage outputs were made from: "
+              f"starting from parse, not {first}")
+        args.start, args.only = "parse", None
+
+    commands = build_commands(args, xbe, analysis_json, stage_xbe)
 
     print(f"Title    {xbe}")
     print(f"Analysis {analysis_json}")
@@ -348,6 +456,10 @@ def main() -> int:
     if args.dry_run:
         print("\n(dry run: nothing was executed)")
         return 0
+
+    if commands and commands[0][0] == "parse":
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp_path.write_text(json.dumps(current, indent=1) + "\n", encoding="utf-8")
 
     print(f"\n{'=' * 70}")
     print(f"  Pipeline complete in {time.time() - started:.1f}s")

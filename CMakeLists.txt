@@ -176,6 +176,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         add_subdirectory(tests/mmio_decode_a64) # arm64 fault emulation vs hardware
         add_subdirectory(tests/guest_faults)    # trapped pages via the signal path
         add_subdirectory(tests/memory_layout)   # the real layout, 64 and 128 MB maps
+        add_subdirectory(tests/xbe_patches)     # a patched lift loaded from the unpatched XBE
         add_subdirectory(tests/compat_threads)  # POSIX thread and fiber shims
         add_subdirectory(tests/kernel_directory_posix) # NtClose releases a directory search
     endif()

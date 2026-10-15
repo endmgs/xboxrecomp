@@ -117,6 +117,26 @@ def check_data_matches_binary(xbe_path, summary_path):
         sys.exit(1)
 
 
+def _write_xbe_patches(gen_dir, xbe_path, original):
+    """recomp_xbe_patches.c when the lift read a patched XBE; otherwise make
+    sure none is left from an earlier lift, so a title lifted without patches
+    gets exactly the sources it always did."""
+    path = os.path.join(gen_dir, "recomp_xbe_patches.c")
+    if not original:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"  removed {os.path.basename(path)} (no XBE patches)",
+                  file=sys.stderr)
+        return
+    from tools.xbe_patch import render_c
+    with open(original, "rb") as fh:
+        before = fh.read()
+    with open(xbe_path, "rb") as fh:
+        after = fh.read()
+    write_if_changed(path, render_c(before, after))
+    print(f"XBE patches for the runtime: {path}", file=sys.stderr)
+
+
 def game_categories(classification_db):
     """Every category that is game code, plus the unclassified remainder.
 
@@ -281,6 +301,11 @@ def main():
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
                              "hand-written definition links instead")
+    parser.add_argument("--xbe-original", metavar="XBE",
+                        help="xbe_path is a patched copy of this XBE "
+                             "(tools.xbe_patch): write recomp_xbe_patches.c, "
+                             "the runtime's copy of the difference, into the "
+                             "generated sources (docs/technical/xbe-patches.md)")
     parser.add_argument("--hle-symbols", metavar="FILE",
                         help="tools.xdk_symbols JSON for this XBE. XDK functions "
                              "with an HLE_EXPORT(Name) implementation are "
@@ -771,6 +796,7 @@ def main():
         write_if_changed(os.path.join(gen_dir, "recomp_hle.c"),
                          render_thunks(hle_replace, hle_variables, hle_originals,
                                        hle_groups))
+        _write_xbe_patches(gen_dir, args.xbe_path, args.xbe_original)
 
         t_translate = time.time() - t0
         print(f"\n=== Split Translation Complete ({t_translate:.1f}s) ===",

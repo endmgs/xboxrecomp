@@ -20,6 +20,8 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    xbe_patches.c
+    xbe_patches_none.c
     xbox_watchpoint.c
     xbox_fault_route.c
     xbox_nic.c

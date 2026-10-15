@@ -19,6 +19,7 @@
 #include "platform/fault_emulate.h" /* recomp_fault_set_guest_base */
 #include "platform/host_timer.h"   /* the flip gate's and the ack thread's waits */
 #include "xbox_nic.h"
+#include "xbe_patches.h"     /* patches applied before the image is mapped */
 #include <stdio.h>
 /* <stdlib.h> is load-bearing, not tidiness.
  *
@@ -3243,7 +3244,33 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+static BOOL memory_layout_init(const void *xbe_data, size_t xbe_size);
+
+/* The image is mapped as the title was lifted: when its XBE was patched
+ * before the lift (docs/technical/xbe-patches.md), the same patches are
+ * applied to this copy of the file first, so the added sections, the moved
+ * tables and the header that names them are all mapped below like any other
+ * part of the image. No patches linked in: the file as it is. */
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
+{
+    uint8_t *patched = NULL;
+    size_t patched_size = 0;
+    BOOL ok;
+
+    if (g_memory_base) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
+        return FALSE;
+    }
+    if (xbox_xbe_patches_apply((const uint8_t *)xbe_data, xbe_size,
+                               &patched, &patched_size) < 0)
+        return FALSE;
+    ok = patched ? memory_layout_init(patched, patched_size)
+                 : memory_layout_init(xbe_data, xbe_size);
+    free(patched);      /* nothing keeps a pointer into the file (see main.c) */
+    return ok;
+}
+
+static BOOL memory_layout_init(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
