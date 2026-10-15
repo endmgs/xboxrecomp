@@ -175,7 +175,7 @@ reverse engineering or tooling that transfers to no other game.
 
 | # | Work item | Route | Days | Kind |
 |---|---|---|---|---|
-| T1 | Overlay directory in `kernel_path.c`: try `<overlay>/<rel>` before `<game_dir>/<rel>`, behind an env switch | A | 1 | Toolkit |
+| T1 | Overlay directory in `kernel_path.c`: try `<overlay>/<rel>` before `<game_dir>/<rel>`, behind an env switch. **Done (Oct 2026): `RECOMP_MODS`**, see below | A | 1 | Toolkit |
 | T2 | `P8CK`/`P4CK` unpack + repack tool in `tools/` | A | 0.5 | TS2 (or use `tspak`/`Splitter`: 0) |
 | T3 | `.xbt` ↔ DDS converter, all four format codes | A | 1–2 | TS2 (or use `fmt_xbox.py` as a spec: 1) |
 | T4 | Unsampled content hash at cache-entry time, exposed; `RECOMP_TEX_DUMP` writes every bound texture as DDS named by hash | B | 1–2 | Toolkit |
@@ -187,6 +187,17 @@ reverse engineering or tooling that transfers to no other game.
 disc image that the title loads with no runtime involvement at all.
 
 **Route B textures: 3.5–6 days** (T4–T6), excluding T7.
+
+**T1 is done (15 Oct 2026).** `RECOMP_MODS=<folder>[:<folder>...]` (`;` on Windows)
+names folders laid out like the disc; a file the title opens from the disc
+(`\Device\CdRom0\`, `D:`) is read from the first folder that has it, and
+`[MODS] <path> from <file>` says so. Partitions that also map to the game folder are
+never redirected, so saves cannot land in a mod. Checked on TimeSplitters 2 (macOS):
+a repacked `data/story/l_35_ST.pak` with its character textures filled red drew
+Siberia's guards red. One thing that check found: TS2's level paks carry their own
+copies of every character in the level (byte-identical to `chr.pak`'s, textures under
+the same global numbers), so a character mod replaces files in every pak that holds
+them, not only in `chr.pak`.
 
 ### Models
 

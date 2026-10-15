@@ -121,6 +121,60 @@ static const path_rule s_rules[] = {
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 
 /*
+ * Mods: RECOMP_MODS names folders laid out like the disc (a replacement
+ * chr.pak goes in <mod>/data/chr.pak), separated as PATH is (';' on Windows,
+ * ':' elsewhere); the first that holds a file wins over the next and over the
+ * disc. Only a file read from the disc is looked up -- \Device\CdRom0\ and
+ * D: -- and only if the mod has it, so a title writing to a partition that
+ * also maps to the game folder (TimeSplitters 2's saves on E:) never writes
+ * into a mod. A directory is the disc's: listing one does not merge mods in.
+ */
+#define MOD_DIR_MAX 16
+static char s_mod_dirs[MOD_DIR_MAX][MAX_PATH];
+static int  s_mod_count = -1;   /* -1: RECOMP_MODS not read yet */
+
+#ifdef _WIN32
+#define MOD_LIST_SEP ';'
+#else
+#define MOD_LIST_SEP ':'
+#endif
+
+static void mods_init(void)
+{
+    const char *env = getenv("RECOMP_MODS");
+    const char *s = env;
+
+    s_mod_count = 0;
+    while (s && *s && s_mod_count < MOD_DIR_MAX) {
+        const char *end = strchr(s, MOD_LIST_SEP);
+        size_t len = end ? (size_t)(end - s) : strlen(s);
+        if (len > 0 && len < MAX_PATH) {
+            char *d = s_mod_dirs[s_mod_count];
+            memcpy(d, s, len);
+            d[len] = 0;
+            while (len > 1 && (d[len - 1] == '/' || d[len - 1] == '\\'))
+                d[--len] = 0;
+            fprintf(stderr, "[MODS] %d: %s\n", s_mod_count, d);
+            s_mod_count++;
+        }
+        s = end ? end + 1 : NULL;
+    }
+    if (s && *s)
+        fprintf(stderr, "[MODS] more than %d folders in RECOMP_MODS; the rest are ignored\n",
+                MOD_DIR_MAX);
+    fflush(stderr);
+}
+
+/* A rule that reads the disc, as opposed to a partition that happens to map
+ * to the game folder too. */
+static int rule_is_disc(int i)
+{
+    const char *p = s_rules[i].prefix;
+    return strcmp(p, "\\Device\\CdRom0\\") == 0 || strcmp(p, "D:\\") == 0 ||
+           strcmp(p, "d:\\") == 0 || strcmp(p, "\\??\\D:\\") == 0;
+}
+
+/*
  * Rewrite a path through a drive letter the title mapped for itself.
  *
  * Titles do their own mounting. Wreckless calls IoCreateSymbolicLink at guest
@@ -500,6 +554,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char*  sub_dir   = NULL;
     char         sub_buf[64];   /* cache_sub_dir */
     int          skip;
+    int          disc = 0;      /* rule_is_disc: RECOMP_MODS may hold it */
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -525,6 +580,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = cache_sub_dir(s_rules[i].sub_win, '\\', sub_buf, sizeof sub_buf);
+            disc      = rule_is_disc(i);
             goto translate;
         }
     }
@@ -594,6 +650,21 @@ translate:
             SHCreateDirectoryExW(NULL, dir_path, NULL);   /* Cache\<title id> is two deep */
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+        }
+
+        if (s_mod_count < 0)
+            mods_init();
+        for (int m = 0; disc && remainder_wide[0] && m < s_mod_count; m++) {
+            WCHAR mod_path[MAX_PATH];
+            DWORD attr;
+            swprintf_s(mod_path, MAX_PATH, L"%S\\%s", s_mod_dirs[m], remainder_wide);
+            attr = GetFileAttributesW(mod_path);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                fprintf(stderr, "  [MODS] %s from %ls\n", xbox_path, mod_path);
+                fflush(stderr);
+                wcscpy_s(host_path_buf, buf_size, mod_path);
+                break;
+            }
         }
 
         /* An empty remainder means the title opened the device itself, so
@@ -791,6 +862,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     const char* sub_dir   = NULL;
     char        sub_buf[64];   /* cache_sub_dir */
     int         skip;
+    int         disc = 0;      /* rule_is_disc: RECOMP_MODS may hold it */
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
@@ -821,6 +893,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
             sub_dir   = cache_sub_dir(s_rules[i].sub_posix, '/', sub_buf, sizeof sub_buf);
+            disc      = rule_is_disc(i);
             goto translate;
         }
     }
@@ -872,6 +945,20 @@ translate:
             mkdir_p(dir_path);
         } else {
             snprintf(host_path_buf, buf_size, "%s/%s", base_dir, remainder_posix);
+        }
+
+        if (s_mod_count < 0)
+            mods_init();
+        for (int m = 0; disc && remainder_posix[0] && m < s_mod_count; m++) {
+            char mod_path[MAX_PATH * 2];
+            struct stat st;
+            snprintf(mod_path, sizeof mod_path, "%s/%s", s_mod_dirs[m], remainder_posix);
+            if (stat(mod_path, &st) == 0 && S_ISREG(st.st_mode)) {
+                fprintf(stderr, "  [MODS] %s from %s\n", xbox_path, mod_path);
+                fflush(stderr);
+                snprintf(host_path_buf, buf_size, "%s", mod_path);
+                break;
+            }
         }
 
         {
