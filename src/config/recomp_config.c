@@ -284,6 +284,63 @@ static int readable(const char *path)
     return 1;
 }
 
+/* --------------------------------------------------------- title options */
+
+/* The title's own options (recomp_config.h), compiled in from the file its
+ * CMakeLists' recomp_title_option calls write, so the game and its
+ * launcher are given the same list. */
+#ifdef RECOMP_TITLE_OPTIONS_INC
+static const RecompTitleOption k_title_options[] = {
+#include RECOMP_TITLE_OPTIONS_INC
+};
+#define TITLE_OPTION_COUNT ((int)(sizeof k_title_options / sizeof k_title_options[0]))
+#else
+static const RecompTitleOption k_title_options[1];
+#define TITLE_OPTION_COUNT 0
+#endif
+
+int recomp_title_option_count(void)
+{
+    return TITLE_OPTION_COUNT < RECOMP_TITLE_OPTIONS_MAX
+           ? TITLE_OPTION_COUNT : RECOMP_TITLE_OPTIONS_MAX;
+}
+
+const RecompTitleOption *recomp_title_option_at(int i)
+{
+    return (i >= 0 && i < recomp_title_option_count()) ? &k_title_options[i] : NULL;
+}
+
+/* "# "-prefixed lines of at most 72 columns, the text's words in order. */
+static void write_wrapped_comment(FILE *f, const char *text)
+{
+    char line[96];
+    size_t len = 0;
+
+    while (text && *text) {
+        const char *w = text;
+        size_t wl;
+
+        while (*w == ' ')
+            w++;
+        wl = strcspn(w, " ");
+        if (!wl)
+            break;
+        text = w + wl;
+        if (wl > 68)
+            wl = 68;
+        if (len && len + 1 + wl > 70) {
+            fprintf(f, "# %.*s\n", (int)len, line);
+            len = 0;
+        }
+        if (len)
+            line[len++] = ' ';
+        memcpy(line + len, w, wl);
+        len += wl;
+    }
+    if (len)
+        fprintf(f, "# %.*s\n", (int)len, line);
+}
+
 /* ------------------------------------------------------------ settings */
 
 void recomp_settings_defaults(RecompSettings *s)
@@ -305,6 +362,13 @@ void recomp_settings_defaults(RecompSettings *s)
     snprintf(s->syslink, sizeof s->syslink, "off");
     s->syslink_port      = RECOMP_SYSLINK_DEFAULT_PORT;
     s->syslink_upnp      = 1;
+    {
+        int i;
+
+        for (i = 0; i < recomp_title_option_count(); i++)
+            snprintf(s->title_option[i], sizeof s->title_option[i], "%s",
+                     k_title_options[i].values[0] ? k_title_options[i].values[0] : "");
+    }
 }
 
 static int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -383,6 +447,13 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             snprintf(s->syslink_code, sizeof s->syslink_code, "%s", v);
         if ((v = from_table("syslink_upnp")) != NULL)
             s->syslink_upnp = !off_word(v);
+        {
+            int i;
+
+            for (i = 0; i < recomp_title_option_count(); i++)
+                if ((v = from_table(k_title_options[i].key)) != NULL)
+                    snprintf(s->title_option[i], sizeof s->title_option[i], "%s", v);
+        }
     }
 
     memcpy(g_entries, saved, sizeof saved);
@@ -560,6 +631,37 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# on the internet can join. 0 leaves the router alone. [RECOMP_SYSLINK_UPNP]\n"
         "syslink_upnp = %d\n",
         s->syslink_upnp ? 1 : 0);
+
+    /* The title's own, each with its help, the values it takes and the
+     * variable over it. */
+    if (recomp_title_option_count() > 0) {
+        int i;
+
+        fprintf(f, "\n# This game's own settings.\n");
+        for (i = 0; i < recomp_title_option_count(); i++) {
+            const RecompTitleOption *o = &k_title_options[i];
+            char values[256];
+            size_t len = 0;
+            int k;
+
+            values[0] = '\0';
+            for (k = 0; o->values[k] && len < sizeof values - 1; k++) {
+                int w = snprintf(values + len, sizeof values - len, "%s%s",
+                                 k ? ", " : "", o->values[k]);
+                if (w < 0)
+                    break;
+                len += (size_t)w;
+            }
+            fprintf(f, "#\n");
+            write_wrapped_comment(f, o->label);
+            write_wrapped_comment(f, o->help);
+            fprintf(f, "# One of: %s.%s%s%s\n", values,
+                    o->env ? "   [" : "", o->env ? o->env : "", o->env ? "]" : "");
+            fprintf(f, "%s = %s\n", o->key,
+                    s->title_option[i][0] ? s->title_option[i]
+                    : (o->values[0] ? o->values[0] : ""));
+        }
+    }
 
     fclose(f);
     return 1;

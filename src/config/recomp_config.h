@@ -170,6 +170,44 @@ void recomp_widescreen_resolve_from(int on, const char *hor_plus, const char *re
                                     RecompWideMode mode, int title_register,
                                     RecompWidescreen *out);
 
+/* -------------------------------------------------------- title options */
+
+/* A setting that belongs to one game: a mode the title's own overrides add
+ * (TimeSplitters 2's big heads), not something the runtime does for every
+ * title. The title's project declares it in its CMakeLists, after the
+ * add_subdirectory that brings the toolkit in (src/config/CMakeLists.txt):
+ *
+ *     recomp_title_option(ts2_big_head ENV RECOMP_TS2_BIG_HEAD
+ *         LABEL "Big heads" HELP "Every character's head drawn bigger."
+ *         VALUES 1 1.5 2 2.5 3  NAMES Off 1.5x 2x 2.5x 3x)
+ *
+ * and gets three things from that one line: the settings file keeps the
+ * key (written with its help, read back, never dropped by the launcher's
+ * save as an unknown key would be), the launcher shows a row for it on its
+ * Game tab, stepping through VALUES (shown as NAMES), and the game reads
+ * it as any other setting, environment first:
+ *
+ *     recomp_config_float("RECOMP_TS2_BIG_HEAD", "ts2_big_head", 1.0)
+ *
+ * VALUES[0] is the default. A value set by hand in the file that is not one
+ * of VALUES is kept as it is until the row is moved. */
+#define RECOMP_TITLE_OPTIONS_MAX        8
+#define RECOMP_TITLE_OPTION_CHOICES_MAX 12
+#define RECOMP_TITLE_OPTION_VALUE_LEN   32
+
+typedef struct RecompTitleOption {
+    const char *key;            /* in the settings file */
+    const char *env;            /* the environment variable over it, or NULL */
+    const char *label;          /* the launcher row's name */
+    const char *help;           /* the launcher's line under it, and the file's comment */
+    const char *values[RECOMP_TITLE_OPTION_CHOICES_MAX + 1];   /* NULL ends; [0] is the default */
+    const char *names[RECOMP_TITLE_OPTION_CHOICES_MAX + 1];    /* shown for each; NULL: the value */
+} RecompTitleOption;
+
+/* The options the title declared, 0 for a title that declared none. */
+int                      recomp_title_option_count(void);
+const RecompTitleOption *recomp_title_option_at(int i);
+
 /* ------------------------------------------------------------ settings */
 
 /* hor_plus and hor_plus_register left for the title to decide. Written to
@@ -204,6 +242,10 @@ typedef struct RecompSettings {
     int  syslink_port;          /* the port a host listens on, and joins use */
     char syslink_code[64];      /* the session's join code; empty for none */
     int  syslink_upnp;          /* host: ask the router to forward the port */
+
+    /* The title's own options, by recomp_title_option_at index: each one's
+     * value as the file has it (the option's default when it has none). */
+    char title_option[RECOMP_TITLE_OPTIONS_MAX][RECOMP_TITLE_OPTION_VALUE_LEN];
 } RecompSettings;
 
 /* The port a System Link host listens on when nobody chooses one. The same

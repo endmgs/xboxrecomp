@@ -78,6 +78,9 @@ typedef struct Row {
     RowKind     kind;
     int         lo, hi;                 /* ROW_INT */
     const char *const *choices;         /* ROW_CHOICE, NULL terminated */
+    const char *const *names;           /* ROW_CHOICE: shown for each choice, or NULL */
+    const char *by_hand;                /* ROW_CHOICE: shown while *ival is -1, a value
+                                         * the file holds that is not a choice */
     int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
     char       *text;                   /* ROW_TEXT: typed into, Ctrl+V pastes */
     size_t      text_len;
@@ -93,6 +96,12 @@ static int            g_widescreen;        /* the row; settings_save applies it 
 
 static Row  g_video_rows[12];
 static int  g_video_count;
+
+/* ---- the game's own options (recomp_title_option), on the Game tab ---- */
+
+static Row  g_game_rows[RECOMP_TITLE_OPTIONS_MAX];
+static int  g_game_count;
+static int  g_game_index[RECOMP_TITLE_OPTIONS_MAX];   /* into its values, -1 by hand */
 
 /* ---- System Link ---- */
 
@@ -224,6 +233,44 @@ static void build_rows(void)
     g_video_count = (int)(r - g_video_rows);
 }
 
+/* One row for each option the title declared, stepping through its values. */
+static void build_game_rows(void)
+{
+    int i;
+
+    g_game_count = recomp_title_option_count();
+    for (i = 0; i < g_game_count; i++) {
+        const RecompTitleOption *o = recomp_title_option_at(i);
+        Row *r = &g_game_rows[i];
+
+        memset(r, 0, sizeof *r);
+        r->label   = o->label;
+        r->help    = o->help;
+        r->kind    = ROW_CHOICE;
+        r->choices = o->values;
+        r->names   = o->names[0] ? o->names : NULL;
+        r->by_hand = g_settings.title_option[i];
+        r->ival    = &g_game_index[i];
+    }
+}
+
+/* Where each option's value from the file is among its choices. */
+static void game_rows_load(void)
+{
+    int i, k;
+
+    for (i = 0; i < recomp_title_option_count(); i++) {
+        const RecompTitleOption *o = recomp_title_option_at(i);
+
+        g_game_index[i] = -1;
+        for (k = 0; o->values[k]; k++)
+            if (strcmp(o->values[k], g_settings.title_option[i]) == 0) {
+                g_game_index[i] = k;
+                break;
+            }
+    }
+}
+
 static const char *link_mode_label(int i)
 {
     switch (i) {
@@ -350,7 +397,13 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        if (r->ival == &g_link_mode)
+        if (r->by_hand) {               /* a title option */
+            if (*r->ival < 0)
+                snprintf(out, n, "%s  (set in the settings file)", r->by_hand);
+            else
+                snprintf(out, n, "%s", r->names ? r->names[*r->ival]
+                                                : r->choices[*r->ival]);
+        } else if (r->ival == &g_link_mode)
             snprintf(out, n, "%s", link_mode_label(*r->ival));
         else
             snprintf(out, n, "%s", frame_cap_label(*r->ival));
@@ -683,6 +736,7 @@ static void settings_load(void)
         g_link_mode = LINK_BY_HAND;
     snprintf(g_port_text, sizeof g_port_text, "%d", g_settings.syslink_port);
     build_link_rows();
+    game_rows_load();
 }
 
 static void bindings_load(void)
@@ -729,6 +783,15 @@ static int settings_save(void)
         snprintf(g_settings.syslink, sizeof g_settings.syslink, "%s",
                  k_link_modes[g_link_mode]);
     g_settings.syslink_port = link_port();
+    {
+        /* A value set by hand stays as it is until its row is moved. */
+        int i;
+
+        for (i = 0; i < recomp_title_option_count(); i++)
+            if (g_game_index[i] >= 0)
+                snprintf(g_settings.title_option[i], sizeof g_settings.title_option[i],
+                         "%s", recomp_title_option_at(i)->values[g_game_index[i]]);
+    }
 
     if (!recomp_settings_path(g_title_id, path, sizeof path))
         return 0;
@@ -831,8 +894,34 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 
 /* ----------------------------------------------------------------- state */
 
-typedef enum { TAB_VIDEO, TAB_INPUT, TAB_LINK, TAB_ABOUT, TAB_COUNT } Tab;
-static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "SYSTEM LINK", "ABOUT" };
+typedef enum { TAB_VIDEO, TAB_GAME, TAB_INPUT, TAB_LINK, TAB_ABOUT, TAB_COUNT } Tab;
+static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "GAME", "INPUT", "SYSTEM LINK", "ABOUT" };
+
+/* The tabs shown, left to right: the Game tab only for a title that
+ * declared options of its own. */
+static Tab g_tab_order[TAB_COUNT];
+static int g_tab_shown;
+
+static void tabs_build(void)
+{
+    int t;
+
+    g_tab_shown = 0;
+    for (t = 0; t < TAB_COUNT; t++)
+        if (t != TAB_GAME || recomp_title_option_count() > 0)
+            g_tab_order[g_tab_shown++] = (Tab)t;
+}
+
+/* Where a tab is in the row of them. */
+static int tab_pos(Tab t)
+{
+    int i;
+
+    for (i = 0; i < g_tab_shown; i++)
+        if (g_tab_order[i] == t)
+            return i;
+    return 0;
+}
 
 static Tab    g_tab;
 static Tab    g_tab_from;
@@ -851,6 +940,10 @@ static Row *tab_rows(int *count)
     if (g_tab == TAB_LINK) {
         *count = g_link_count;
         return g_link_rows;
+    }
+    if (g_tab == TAB_GAME) {
+        *count = g_game_count;
+        return g_game_rows;
     }
     *count = 0;
     return NULL;
@@ -969,6 +1062,7 @@ static void set_tab(Tab t)
 static void rows_for_tab(void)
 {
     g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
+                  : (g_tab == TAB_GAME)  ? g_game_count
                   : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE
                   : (g_tab == TAB_LINK)  ? g_link_count : 0;
     if (g_sel >= g_rows_on_tab)
@@ -1010,7 +1104,7 @@ static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
         return;
     }
     if (tabdelta)
-        set_tab((Tab)((g_tab + tabdelta + TAB_COUNT) % TAB_COUNT));
+        set_tab(g_tab_order[(tab_pos(g_tab) + tabdelta + g_tab_shown) % g_tab_shown]);
 
     if (g_tab == TAB_INPUT) {
         int k = g_bind_top + g_sel;
@@ -1234,14 +1328,14 @@ static void draw(void)
     r.x = 60; r.y = 30; r.w = g_cw - 120; r.h = 46;
     theme_text(r, g_title_name, 26, 700, THEME_TEXT, THEME_LEFT);
 
-    for (i = 0; i < TAB_COUNT; i++) {
+    for (i = 0; i < g_tab_shown; i++) {
         ThemeRect t = tab_rect(i);
 
-        theme_text(t, k_tab_names[i], 12, 700,
-                   i == g_tab ? THEME_GREEN : THEME_TEXT_DIM, THEME_CENTRE);
+        theme_text(t, k_tab_names[g_tab_order[i]], 12, 700,
+                   g_tab_order[i] == g_tab ? THEME_GREEN : THEME_TEXT_DIM, THEME_CENTRE);
     }
     {
-        ThemeRect a = tab_rect(g_tab_from), b = tab_rect(g_tab);
+        ThemeRect a = tab_rect(tab_pos(g_tab_from)), b = tab_rect(tab_pos(g_tab));
 
         a.y += 34; b.y += 34;
         theme_tab_underline(a, b, g_tab_t);
@@ -1249,6 +1343,8 @@ static void draw(void)
 
     if (g_tab == TAB_VIDEO) {
         draw_rows(g_video_rows, g_video_count, 0);
+    } else if (g_tab == TAB_GAME) {
+        draw_rows(g_game_rows, g_game_count, 1);
     } else if (g_tab == TAB_LINK) {
         draw_link();
     } else if (g_tab == TAB_INPUT) {
@@ -1489,6 +1585,8 @@ void launcher_init(void)
     settings_load();
     bindings_load();
     build_rows();
+    build_game_rows();
+    tabs_build();
     rows_for_tab();
 }
 
@@ -1540,11 +1638,11 @@ void launcher_click(int mx, int my)
 {
     int i;
 
-    for (i = 0; i < TAB_COUNT; i++) {
+    for (i = 0; i < g_tab_shown; i++) {
         ThemeRect t = tab_rect(i);
 
         if (mx >= t.x && mx < t.x + t.w && my >= t.y && my < t.y + t.h)
-            set_tab((Tab)i);
+            set_tab(g_tab_order[i]);
     }
     if (g_tab == TAB_INPUT) {
         int j;
