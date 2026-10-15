@@ -24,13 +24,13 @@ void xbox_NetLanKey(uint8_t out[16]);
 
 /* Trap the register page if anything asks for it (RECOMP_SYSLINK for the
  * card, RECOMP_NIC_TRACE for the log). host is the page's host address. Call
- * once, after the MCPX aperture is mapped. */
+ * once, after the MCPX aperture is mapped. The card registers its own fault
+ * range (recomp_fault_add_range), on Windows and POSIX alike. */
 void xbox_NicInit(void *host);
 
-/* Offer an access violation at guest address xbox_va to the card. Returns
- * non-zero when it was the card's and has been serviced, in which case the
- * caller must return EXCEPTION_CONTINUE_EXECUTION. ctx is the PCONTEXT. */
-int xbox_NicHandleMmio(void *ctx, uint32_t xbox_va, int is_write);
+/* Whether the card is on (and its page trapped): a cable is plugged in, so
+ * PhyGetLinkState reports a link whatever RECOMP_ETHERNET_LINK says. */
+int  xbox_NicCardOn(void);
 
 /* From the kernel's timer thread: received frames into the receive ring,
  * and the summary every five seconds. */

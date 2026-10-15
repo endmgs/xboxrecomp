@@ -411,11 +411,15 @@ ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
      * retries for 25 to 100 s before XNet gave up. With no link XNet marks
      * the address "troubleshoot" at once and the title moves on, as a
      * console with nothing plugged in does. Off by default, because a title
-     * with a System Link menu says "no cable" rather than searching. */
+     * with a System Link menu says "no cable" rather than searching.
+     *
+     * With the network card on (System Link, xbox_nic.c) there is a cable,
+     * whatever the variable says: a title that turns the link off for the
+     * no-card case, as Rainbow Six 3 does, still finds it. */
     static int link = -1;
     (void)Verify;
     if (link < 0)
-        link = xbox_EnvSwitch("RECOMP_ETHERNET_LINK", 1);
+        link = xbox_NicCardOn() || xbox_EnvSwitch("RECOMP_ETHERNET_LINK", 1);
     /* Link up, 100 Mbps, full duplex */
     return link ? 0x01 : 0x00; /* XNET_ETHERNET_LINK_ACTIVE or nothing */
 }

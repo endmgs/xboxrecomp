@@ -60,11 +60,14 @@
 #include "xbox_net_udp.h"
 #include "recomp_config.h"   /* recomp_config_user_dir: keys.ini */
 
+#include "platform/fault_emulate.h"   /* recomp_fault_add_range */
 #ifdef _WIN32
 #include <bcrypt.h>
 #include <dbghelp.h>
 #include "platform/mmio_decode.h"
-#include "platform/fault_emulate.h"   /* recomp_fault_add_range */
+#else
+#include <dlfcn.h>                    /* dladdr: the log names a host pc */
+#include "platform/win32_compat.h"    /* VirtualProtect, CRITICAL_SECTION */
 #endif
 
 /* ---- the Ethernet address -------------------------------------------- */
@@ -328,7 +331,12 @@ static void load_lan_key(uint8_t out[16])
 
 /* ---- the registers ---------------------------------------------------- */
 
-#ifdef _WIN32
+/* The same model on every host. What differs is how a trapped access gets
+ * here: on Windows a vectored handler with the x86 decoder, on POSIX a
+ * signal handler with the host CPU's decoder (fault_emulate.h). On POSIX all
+ * of the card's work on an access therefore runs inside a signal handler,
+ * where a second fault is fatal; that is why guest memory is reached through
+ * the arena's backdoor there (phys_ptr). */
 
 #define NIC_DWORDS (XBOX_NIC_SIZE / 4)
 
@@ -445,24 +453,50 @@ static void set_reg32(uint32_t off, uint32_t v)
 /* ---- guest memory, by physical address --------------------------------- */
 
 /* A host pointer to len bytes at a physical address, through whichever
- * storage that page was handed out from (xbox_PhysToGuest). */
+ * storage that page was handed out from (xbox_PhysToGuest).
+ *
+ * On POSIX, the arena's always-writable alias of those bytes: a 16 KB host
+ * page holds four guest pages, and one of them trapped or read-only makes
+ * the host page fault for all four, which inside the fault handler would be
+ * the end of the process. NULL if the bytes are not one placement, so not
+ * contiguous in the alias. */
 static uint8_t *phys_ptr(uint32_t phys, uint32_t len, int *low)
 {
     uint8_t *base = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t va;
 
-    if (!base || phys >= XBOX_CONTIG_SIZE || len > XBOX_CONTIG_SIZE - phys)
+    if (!base || !len || phys >= XBOX_CONTIG_SIZE || len > XBOX_CONTIG_SIZE - phys)
         return NULL;
     va = xbox_PhysToGuest(phys);
     if (low)
         *low = (va == phys);
+#ifdef _WIN32
     return base + va;
+#else
+    {
+        uint8_t *first = (uint8_t *)w32_backdoor(base + va);
+        uint8_t *last = (uint8_t *)w32_backdoor(base + va + len - 1u);
+        if (!first || last != first + len - 1u)
+            return NULL;
+        return first;
+    }
+#endif
 }
 
 /* ---- the log ------------------------------------------------------------ */
 
 static void print_rip(uintptr_t rip)
 {
+#ifndef _WIN32
+    /* The generated functions are exported (ENABLE_EXPORTS), so dladdr names
+     * them as the PDB does on Windows. */
+    Dl_info info;
+    if (dladdr((const void *)rip, &info) && info.dli_sname)
+        fprintf(stderr, "%s+0x%llX", info.dli_sname,
+                (unsigned long long)(rip - (uintptr_t)info.dli_saddr));
+    else
+        fprintf(stderr, "pc 0x%llX", (unsigned long long)rip);
+#else
     char buf[sizeof(SYMBOL_INFO) + 256];
     SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
     DWORD64 disp = 0;
@@ -474,6 +508,7 @@ static void print_rip(uintptr_t rip)
         fprintf(stderr, "%s+0x%llX", sym->Name, (unsigned long long)disp);
     else
         fprintf(stderr, "RIP 0x%llX", (unsigned long long)rip);
+#endif
 }
 
 static void flush_repeats(void)
@@ -831,10 +866,49 @@ static void untrap(const char *why)
 
 /* The fault route's way in (xbox_fault_route.c). The page used to be routed
  * by each title's main.c; since faults are routed by the runtime, a trapped
- * device registers its own range. */
+ * device registers its own range.
+ *
+ * On POSIX this runs in the signal handler. The lock is safe there because
+ * the fault is synchronous and no thread holding the lock ever touches the
+ * page: the timer thread works on the register copy and the rings. */
 static int nic_fault(recomp_fault *f, uint32_t va)
 {
-    return xbox_NicHandleMmio(f->ctx, va, f->is_write == 1);
+    int ok;
+
+    /* Whether the page was ever trapped, not whether it still is: a fault
+     * already in flight on another thread when the trap stops must be
+     * retried on the now-plain page below, not declined as a crash. */
+    if (!s_nic.host || va < XBOX_NIC_BASE || va >= XBOX_NIC_BASE + XBOX_NIC_SIZE)
+        return 0;
+
+    EnterCriticalSection(&s_nic.lock);
+    if (!s_nic.trapped) {               /* untrapped by another thread */
+        LeaveCriticalSection(&s_nic.lock);
+        return 1;                       /* retry on plain memory */
+    }
+#ifdef _WIN32
+    s_nic.rip = (uintptr_t)((PCONTEXT)f->ctx)->Rip;
+    ok = mmio_emulate((PCONTEXT)f->ctx, va - XBOX_NIC_BASE, &s_nic,
+                      nic_read, nic_write);
+#else
+    s_nic.rip = f->pc;
+    ok = recomp_fault_emulate(f, (uintptr_t)s_nic.host, &s_nic,
+                              nic_read, nic_write);
+#endif
+    if (!ok) {
+        char insn[64], why[160];
+        s_nic.n_undecoded++;
+        recomp_fault_insn_text(f, insn, sizeof insn);
+        snprintf(why, sizeof why, "undecoded access at +0x%03X, host insn %s",
+                 va - XBOX_NIC_BASE, insn);
+        untrap(why);
+        /* Not stepped over: returning handled re-runs the instruction, now
+         * on plain memory, which is what it would have done untraced. */
+    }
+    if (s_nic.trace)
+        fflush(stderr);
+    LeaveCriticalSection(&s_nic.lock);
+    return 1;
 }
 
 void xbox_NicInit(void *host)
@@ -865,7 +939,7 @@ void xbox_NicInit(void *host)
                            nic_fault, "NIC registers");
     if (!VirtualProtect(host, XBOX_NIC_SIZE, PAGE_NOACCESS, &old)) {
         fprintf(stderr, "[NIC] cannot trap 0x%08X (error %lu); no card\n",
-                XBOX_NIC_BASE, GetLastError());
+                XBOX_NIC_BASE, (unsigned long)GetLastError());
         s_nic.model = 0;
         return;
     }
@@ -879,41 +953,9 @@ void xbox_NicInit(void *host)
     fflush(stderr);
 }
 
-int xbox_NicHandleMmio(void *ctx, uint32_t xbox_va, int is_write)
+int xbox_NicCardOn(void)
 {
-    PCONTEXT c = (PCONTEXT)ctx;
-    int ok;
-
-    (void)is_write;
-    /* Whether the page was ever trapped, not whether it still is: a fault
-     * already in flight on another thread when the trap stops must be
-     * retried on the now-plain page below, not declined as a crash. */
-    if (!s_nic.host || xbox_va < XBOX_NIC_BASE ||
-        xbox_va >= XBOX_NIC_BASE + XBOX_NIC_SIZE)
-        return 0;
-
-    EnterCriticalSection(&s_nic.lock);
-    if (!s_nic.trapped) {               /* untrapped by another thread */
-        LeaveCriticalSection(&s_nic.lock);
-        return 1;                       /* retry on plain memory */
-    }
-    s_nic.rip = (uintptr_t)c->Rip;
-    ok = mmio_emulate(c, xbox_va - XBOX_NIC_BASE, &s_nic, nic_read, nic_write);
-    if (!ok) {
-        const uint8_t *ip = (const uint8_t *)c->Rip;
-        char why[160];
-        s_nic.n_undecoded++;
-        snprintf(why, sizeof why, "undecoded access at +0x%03X, host bytes "
-                 "%02X %02X %02X %02X %02X %02X", xbox_va - XBOX_NIC_BASE,
-                 ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
-        untrap(why);
-        /* Not stepped over: returning handled re-runs the instruction, now
-         * on plain memory, which is what it would have done untraced. */
-    }
-    if (s_nic.trace)
-        fflush(stderr);
-    LeaveCriticalSection(&s_nic.lock);
-    return 1;
+    return s_nic.model;
 }
 
 int xbox_NicIrqPending(void)
@@ -1022,17 +1064,3 @@ void xbox_NicTick(void)
     fflush(stderr);
     LeaveCriticalSection(&s_nic.lock);
 }
-
-#else /* !_WIN32 */
-
-/* No trap on POSIX yet: the page stays plain memory, as it was. */
-void xbox_NicInit(void *host) { (void)host; }
-int  xbox_NicHandleMmio(void *ctx, uint32_t xbox_va, int is_write)
-{
-    (void)ctx; (void)xbox_va; (void)is_write;
-    return 0;
-}
-int  xbox_NicIrqPending(void) { return 0; }
-void xbox_NicTick(void) { }
-
-#endif

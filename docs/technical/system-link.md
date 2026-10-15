@@ -97,8 +97,19 @@ consoles never waits for the host's game.
 
 Limits: IPv4 only; a full 1514-byte frame plus the 4-byte header is past the
 1472 bytes of a 1500-byte internet packet and will be fragmented (no title
-has been seen to send one, see "Measured" below); the card itself is Windows
-only, so a session is between Windows PCs for now.
+has been seen to send one, see "Measured" below).
+
+**macOS (15 Oct 2026).** The card runs on POSIX too: the same model, reached
+through the signal handler and the arm64 decoder (`recomp_fault_emulate`),
+with guest memory reached through the arena's backdoor so the handler can
+never fault twice. Checked on Apple Silicon with Rainbow Six 3: two copies on
+one Mac, one hosting and one joining 127.0.0.1, exchange XNet's frames both
+ways (1 ms round trip), and `tests/syslink_hub` passes. No match has been
+played across them yet, and no Mac has played a Windows PC yet.
+
+With the card on, `PhyGetLinkState` reports a cable whatever
+`RECOMP_ETHERNET_LINK` says (`xbox_NicCardOn`), so a title that turns the
+link off for the no-card case (Rainbow Six 3) still finds it.
 
 Two copies on one PC, hosted: one hosts, the other joins 127.0.0.1, each
 with its own save folder (its own Ethernet address), and the router left
