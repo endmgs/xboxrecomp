@@ -1015,3 +1015,132 @@ int xbox_mods_find(const char *rel, char *out, size_t n)
         out[0] = 0;
     return -1;
 }
+
+/*
+ * The RECOMP_MODS folders themselves, for a title that stacks what several
+ * mods hold rather than taking each file from the first that has it
+ * (TimeSplitters 2 serves files inside its archives from every mod, and
+ * merges every mod's roster table). 0 is the first folder, the one that wins.
+ */
+int xbox_mods_count(void)
+{
+    if (s_mod_count < 0)
+        mods_init();
+    return s_mod_count;
+}
+
+const char *xbox_mods_dir(int i)
+{
+    if (s_mod_count < 0)
+        mods_init();
+    return i >= 0 && i < s_mod_count ? s_mod_dirs[i] : NULL;
+}
+
+/*
+ * Every file under <mod>/<sub> (sub '/' separated; "" for the whole folder),
+ * subfolders included: fn gets the file's path relative to <mod>/<sub> with
+ * '/' between its parts, its host path and its size. Names starting with '.'
+ * (.DS_Store, editor droppings) are left out, files and folders. Meant to be
+ * called once at start-up, so a title indexes a mod once instead of asking
+ * the file system on every lookup. Returns the number of files; -1 when there
+ * is no such mod or folder.
+ */
+#define MODS_WALK_DEPTH 16
+#define MODS_WALK_PATH  (MAX_PATH * 2)
+
+#ifdef _WIN32
+static int mods_walk_dir(char *host, size_t host_len, char *rel, size_t rel_len,
+                         int depth, xbox_mods_walk_fn fn, void *ctx)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    int n = 0;
+
+    if (depth > MODS_WALK_DEPTH || host_len + 3 >= MODS_WALK_PATH)
+        return 0;
+    strcpy(host + host_len, "\\*");
+    h = FindFirstFileA(host, &fd);
+    host[host_len] = 0;
+    if (h == INVALID_HANDLE_VALUE)
+        return -1;
+    do {
+        size_t name_len = strlen(fd.cFileName);
+        if (fd.cFileName[0] == '.' || host_len + 1 + name_len >= MODS_WALK_PATH ||
+            rel_len + 1 + name_len >= MODS_WALK_PATH)
+            continue;
+        snprintf(host + host_len, MODS_WALK_PATH - host_len, "\\%s", fd.cFileName);
+        snprintf(rel + rel_len, MODS_WALK_PATH - rel_len, "%s%s", rel_len ? "/" : "",
+                 fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            int k = mods_walk_dir(host, strlen(host), rel, strlen(rel), depth + 1, fn, ctx);
+            n += k > 0 ? k : 0;
+        } else {
+            fn(rel, host, ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow, ctx);
+            n++;
+        }
+        host[host_len] = 0;
+        rel[rel_len] = 0;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+#else
+#include <dirent.h>
+
+static int mods_walk_dir(char *host, size_t host_len, char *rel, size_t rel_len,
+                         int depth, xbox_mods_walk_fn fn, void *ctx)
+{
+    DIR *d;
+    struct dirent *e;
+    int n = 0;
+
+    if (depth > MODS_WALK_DEPTH)
+        return 0;
+    d = opendir(host);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        struct stat st;
+        size_t name_len = strlen(e->d_name);
+        if (e->d_name[0] == '.' || host_len + 1 + name_len >= MODS_WALK_PATH ||
+            rel_len + 1 + name_len >= MODS_WALK_PATH)
+            continue;
+        snprintf(host + host_len, MODS_WALK_PATH - host_len, "/%s", e->d_name);
+        snprintf(rel + rel_len, MODS_WALK_PATH - rel_len, "%s%s", rel_len ? "/" : "",
+                 e->d_name);
+        if (stat(host, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                int k = mods_walk_dir(host, strlen(host), rel, strlen(rel), depth + 1, fn, ctx);
+                n += k > 0 ? k : 0;
+            } else if (S_ISREG(st.st_mode)) {
+                fn(rel, host, (unsigned long long)st.st_size, ctx);
+                n++;
+            }
+        }
+        host[host_len] = 0;
+        rel[rel_len] = 0;
+    }
+    closedir(d);
+    return n;
+}
+#endif
+
+int xbox_mods_walk(int mod, const char *sub, xbox_mods_walk_fn fn, void *ctx)
+{
+    char host[MODS_WALK_PATH], rel[MODS_WALK_PATH];
+    int len;
+
+    if (s_mod_count < 0)
+        mods_init();
+    if (mod < 0 || mod >= s_mod_count || !fn)
+        return -1;
+    len = snprintf(host, sizeof host, "%s%s%s", s_mod_dirs[mod], sub && *sub ? "/" : "",
+                   sub ? sub : "");
+    if (len < 0 || (size_t)len >= sizeof host)
+        return -1;
+    for (char *p = host + strlen(s_mod_dirs[mod]); *p; p++)
+        if (*p == '/' || *p == '\\')
+            *p = MODS_SEP;
+    rel[0] = 0;
+    return mods_walk_dir(host, strlen(host), rel, 0, 0, fn, ctx);
+}

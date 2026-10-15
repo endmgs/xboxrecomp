@@ -588,6 +588,21 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * hooks read at start-up. */
 int xbox_mods_find(const char *rel, char *out, size_t n);
 
+/* The RECOMP_MODS folders, for a title that stacks what every mod holds:
+ * how many, and the i-th one's host path (0 is the first, which wins; NULL
+ * past the end). */
+int xbox_mods_count(void);
+const char *xbox_mods_dir(int i);
+
+/* Every file under <mod>/<sub> ('/' separated, "" for the whole folder),
+ * subfolders included and names starting with '.' left out: fn gets its path
+ * relative to <mod>/<sub> ('/' between parts), its host path and its size.
+ * For indexing a mod once at start-up. The number of files, or -1 when the
+ * mod or the folder does not exist. */
+typedef void (*xbox_mods_walk_fn)(const char *rel, const char *host_path,
+                                  unsigned long long size, void *ctx);
+int xbox_mods_walk(int mod, const char *sub, xbox_mods_walk_fn fn, void *ctx);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

@@ -205,6 +205,14 @@ first `RECOMP_MODS` folder that has it, and that folder's index, or -1. TimeSpli
 reads `<mod>/ts2/characters.ini` through it at start-up to add a playable character
 (split2-recomp `docs/formats/roster.md`).
 
+For a title that stacks mods rather than taking each file from the first one that has
+it, `xbox_mods_count()` and `xbox_mods_dir(i)` name the folders and
+`xbox_mods_walk(mod, sub, fn, ctx)` calls `fn` once per file under `<mod>/<sub>`
+(relative path, host path, size), so a title indexes its mods once at start-up.
+TimeSplitters 2 (Oct 2026) uses them to serve single files from inside its archives
+from every mod at once and to read every mod's `characters.ini` (split2-recomp
+`docs/modding.md`); whole files still come from the first mod that has them.
+
 ### Models
 
 | # | Work item | Route | Days | Kind |
