@@ -59,7 +59,7 @@
  * Nothing reported it because generated code is compiled with /w (see the game
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. Generated code is
- * still built with warnings off (xboxrecomp_quiet_generated_sources in the
+ * still built with warnings off (xboxrecomp_lifted_sources in the
  * top-level CMakeLists), but with implicit declaration kept as an error. */
 #include <math.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
@@ -604,6 +604,15 @@ void recomp_trace_esp(const char *name, const char *tag);
  * in the recompiled code can overflow. Without the mask, a 64-bit
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
+ *
+ * The mask holds only if the address was computed with defined
+ * arithmetic. A signed overflow inside `addr` is undefined, and the
+ * compiler may then prove the sum fits in 31 bits and widen it to 64
+ * past the cast: `MEM32((int32_t)eax * 0x34 + base)` behind an
+ * eax >= 0 test became one 64-bit multiply-add on arm64, 104 GB out
+ * for eax = 0x7FFFFFFF. So the lifter keeps its arithmetic unsigned
+ * and lifted sources build with -fwrapv (CMakeLists.txt, "Lifted code
+ * wraps"); nothing written here could undo it after the fact.
  */
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 

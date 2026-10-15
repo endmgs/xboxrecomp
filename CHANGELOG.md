@@ -11,6 +11,22 @@ For where each title stands today, see the [README](README.md#title-status).
 
 ## October 2026
 
+### Lifted code wraps on signed overflow (branch `feat/ts2-decomp`, 15 Oct)
+- The lifter writes `imul`'s two- and three-operand forms and `neg` as `uint32_t` arithmetic.
+  They were `(int32_t)a * (int32_t)b` and `-(int32_t)a`, undefined in C when they overflow,
+  which x86 code does on purpose. In TimeSplitters 2's `sub_00051C20`, a multiply behind a
+  test proving eax >= 0 let clang -O3 widen the address to 64 bits past `XBOX_PTR`'s 32-bit
+  cast (arm64 `umaddl`): eax = 0x7FFFFFFF read 104 GB past guest memory instead of wrapping.
+  This is what holds on MSVC, which has no `-fwrapv`.
+- On clang and GCC every title's lifted sources and `recomp_manual.c` also build with
+  `-fwrapv -fno-strict-overflow`, from the toolkit's deferred hook (now
+  `xboxrecomp_lifted_sources`), for signed arithmetic the lifter does not spell out (narrow
+  values promoted to `int`). No title's CMakeLists changes.
+- Cost, TS2 at clang -O3 on arm64: the unsigned forms change 21 of 6,928 lifted functions
+  (19 fewer instructions in 3.39 million); with them in, `-fwrapv` changes none.
+  `tools/recomp/test_lifter_wrapping.py` compiles the emitted text without `-fwrapv` at -O2/-O3
+  and under UBSan. Changes lifter output, so relift.
+
 ### Input scripts on the title's frames (branch `feat/ts2-decomp`, 15 Oct)
 - `RECOMP_INPUT_CLOCK=frames` times `RECOMP_INPUT_SEQ` / `RECOMP_INPUT_SEQ_FILE` by the frames
   the title presents (its own `D3DDevice_Swap` or `Present`, counted at the HLE boundary)

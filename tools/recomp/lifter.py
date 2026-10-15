@@ -2314,7 +2314,9 @@ class Lifter:
         if preserve_carry or self.needs_cf:
             # neg sets CF iff the operand was non-zero (neg/sbb sign-extract).
             out.append(f"_cf = (int)(({val}) != 0);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        # 0 - a in uint32_t: -(int32_t)a is undefined for 0x80000000, which
+        # x86 negates to itself (the reason _lift_imul multiplies unsigned).
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)(0u - (uint32_t){val})"))
         out.append(self._result_snapshot(ops, "neg"))
         return out
 
@@ -2404,16 +2406,27 @@ class Lifter:
                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
+        # The two- and three-operand forms keep the low half of the product,
+        # which is the same bits whether the operands are read as signed or
+        # unsigned, so they multiply as uint32_t. A signed C multiply that
+        # overflows is undefined, and a compiler uses that: TimeSplitters 2's
+        # `imul eax, eax, 0x34` under a `jg` that proved eax >= 0, lifted as
+        # (int32_t)eax * 0x34, let clang drop XBOX_PTR's 32-bit truncation and
+        # address 104 GB past guest memory for eax = 0x7FFFFFFF, where x86
+        # wraps. (A 16-bit operand reads zero-extended: 0xFFFF * 0xFFFF
+        # overflowed an int too.) Unsigned arithmetic wraps on every compiler,
+        # MSVC included, which has no -fwrapv (CMakeLists.txt, "Lifted code
+        # wraps").
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
             src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t)((uint32_t){dst} * (uint32_t){src})")]
         elif nops == 3:
             # Three operand: dst = src1 * imm
             src = _fmt_operand_read(ops[1])
             imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t)((uint32_t){src} * (uint32_t){imm})")]
         return ["/* imul: unexpected form */"]
 
     def _lift_muldiv(self, insn, ops, m):

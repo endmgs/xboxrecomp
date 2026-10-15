@@ -229,23 +229,50 @@ target_link_libraries(xboxrecomp INTERFACE
 # what discarding it once cost. clang and GCC keep an explicit -Werror= under
 # -w; MSVC gets /we4013 after /w for the same reason.
 #
+# ── Lifted code wraps ─────────────────────────────────────────
+#
+# x86 integer arithmetic wraps; C's signed arithmetic is undefined on
+# overflow, and clang and GCC optimise on the assumption that it never
+# happens. In lifted code that assumption is false by construction: the
+# guest's values are whatever the guest computed. TimeSplitters 2's
+# `imul eax, eax, 0x34` behind a `jg` proving eax >= 0 was lifted as a signed
+# multiply, and clang, knowing the product could not overflow, widened the
+# address to 64 bits past XBOX_PTR's 32-bit truncation: eax = 0x7FFFFFFF read
+# 104 GB past guest memory. So two things:
+#
+#  - the lifter emits the arithmetic whose result it keeps (imul's low half,
+#    neg) as uint32_t, which wraps on every compiler (tools/recomp/lifter.py,
+#    _lift_imul). That is the fix MSVC relies on: it has no -fwrapv.
+#  - on clang and GCC, lifted sources and recomp_manual.c (hand-written in the
+#    lifter's idiom) also build with -fwrapv -fno-strict-overflow, for any
+#    signed arithmetic that remains: a uint8_t/uint16_t promoted to int and
+#    multiplied or shifted into the sign bit, a lifter form not yet written
+#    unsigned. Measured on TimeSplitters 2 (clang -O3, arm64): with the lifter
+#    emitting imul and neg unsigned, -fwrapv changes the code of none of its
+#    6,928 functions, so it costs nothing; without that, it changed 21.
+#
 # This reaches every title without editing its CMakeLists. A title pulls the
 # runtime in with add_subdirectory() before it declares its executable, so
 # the work is deferred to the end of the title's own top-level CMakeLists,
 # when its targets exist. A source counts as generated when it sits in a
 # src/recomp/gen/ directory, which is where tools/recomp writes it.
-# -DXBOXRECOMP_GENERATED_WARNINGS=ON shows them again, for lifter work.
+# -DXBOXRECOMP_GENERATED_WARNINGS=ON shows the warnings again, for lifter
+# work; the wrapping stays.
 option(XBOXRECOMP_GENERATED_WARNINGS
        "Report compiler warnings in lifted code (src/recomp/gen)" OFF)
 
-function(xboxrecomp_quiet_generated_sources)
-    if(XBOXRECOMP_GENERATED_WARNINGS)
-        return()
+function(xboxrecomp_lifted_sources)
+    set(_quiet)
+    if(NOT XBOXRECOMP_GENERATED_WARNINGS)
+        if(MSVC)
+            set(_quiet /w /we4013)
+        else()
+            set(_quiet -w -Werror=implicit-function-declaration)
+        endif()
     endif()
-    if(MSVC)
-        set(_opts /w /we4013)
-    else()
-        set(_opts -w -Werror=implicit-function-declaration)
+    set(_wrap)
+    if(NOT MSVC)
+        set(_wrap -fwrapv -fno-strict-overflow)
     endif()
     get_property(_targets DIRECTORY "${CMAKE_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_t IN LISTS _targets)
@@ -256,6 +283,7 @@ function(xboxrecomp_quiet_generated_sources)
         get_target_property(_dir ${_t} SOURCE_DIR)
         get_target_property(_srcs ${_t} SOURCES)
         set(_gen)
+        set(_manual)
         foreach(_s IN LISTS _srcs)
             if(_s MATCHES "\\$<")
                 continue()      # a generator expression: not a plain path
@@ -264,21 +292,33 @@ function(xboxrecomp_quiet_generated_sources)
                        OUTPUT_VARIABLE _abs)
             if(_abs MATCHES "/src/recomp/gen/[^/]+\\.c$")
                 list(APPEND _gen "${_abs}")
+            elseif(_abs MATCHES "/recomp_manual\\.c$")
+                list(APPEND _manual "${_abs}")
             endif()
         endforeach()
-        if(_gen)
+        if(_gen AND (_quiet OR _wrap))
             set_property(SOURCE ${_gen} DIRECTORY "${_dir}"
-                         APPEND PROPERTY COMPILE_OPTIONS ${_opts})
+                         APPEND PROPERTY COMPILE_OPTIONS ${_quiet} ${_wrap})
             list(LENGTH _gen _n)
-            message(STATUS "xboxrecomp: ${_t}: ${_n} lifted sources build "
-                           "without warnings (XBOXRECOMP_GENERATED_WARNINGS=ON "
-                           "to see them)")
+            if(_quiet)
+                message(STATUS "xboxrecomp: ${_t}: ${_n} lifted sources build "
+                               "without warnings (XBOXRECOMP_GENERATED_WARNINGS=ON "
+                               "to see them)")
+            endif()
+        endif()
+        if(_wrap AND (_gen OR _manual))
+            if(_manual)
+                set_property(SOURCE ${_manual} DIRECTORY "${_dir}"
+                             APPEND PROPERTY COMPILE_OPTIONS ${_wrap})
+            endif()
+            message(STATUS "xboxrecomp: ${_t}: lifted code wraps on signed "
+                           "overflow, as x86 does (${_wrap})")
         endif()
     endforeach()
 endfunction()
 
 if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-                   CALL xboxrecomp_quiet_generated_sources)
+                   CALL xboxrecomp_lifted_sources)
 endif()
 

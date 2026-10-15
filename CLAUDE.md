@@ -436,6 +436,22 @@ function's entry (for `[TRACE]` lines, `RECOMP_TRACE_ONLY`, the entry profiler a
 time. A plain lift keeps `RECOMP_SAMPLE` and the kernel log. Both titles are lifted plain
 now; TimeSplitters 2 was re-lifted plain on 19 Sep 2026 with no change in behaviour.
 
+**Lifted code wraps on overflow, as x86 does (Oct 2026).** C's signed overflow is undefined
+and clang/GCC optimise on it; guest values overflow whenever the guest's did. TimeSplitters
+2's `imul eax, eax, 0x34` behind a `jg` proving eax >= 0, lifted as `(int32_t)eax * 0x34`,
+let clang -O3 build the address as one 64-bit multiply-add past `XBOX_PTR`'s `(uint32_t)`
+cast: eax = 0x7FFFFFFF read 104 GB past guest memory. Two rules hold it now: **the lifter
+writes arithmetic whose result it keeps in `uint32_t`** (imul's low half and neg; a signed
+cast belongs only in a comparison, a sign extension, `sar`, or a widening to `int64_t`), and
+the toolkit's deferred hook (`xboxrecomp_lifted_sources`, top-level `CMakeLists.txt`) builds
+every `src/recomp/gen/*.c` and `recomp_manual.c` of every title with `-fwrapv
+-fno-strict-overflow` on clang and GCC. MSVC has no such switch, so on Windows the first rule
+is the whole guarantee: a new lifter form that does signed arithmetic must not rely on the
+flag. `tools/recomp/test_lifter_wrapping.py` compiles the emitted text without `-fwrapv`. With
+both in place `-fwrapv` changes none of TS2's 6,928 functions (clang -O3, arm64); without the
+lifter rule it changed 21, by 19 instructions in 3.39 million. `XBOX_PTR` cannot fix this
+itself: once `addr` is undefined, no cast after it is honoured.
+
 Projects live in `titles/<name>/` (committed: CMakeLists, `main.c`, `recomp_manual.c`),
 game data in `games/<title>/` and stage output in `games/_pipeline/<name>/out` (both
 ignored). Regenerate a title's `main.c` from the template with
@@ -492,6 +508,7 @@ found in three runs once the tools existed.
 | `[THROW] the title threw a C++ exception` | This runtime cannot unwind, so the throw **returns** and everything after it runs on a stack nothing cleaned up. Rerun with `RECOMP_THROW_FATAL=1` and treat that as the real stopping point. `docs/technical/cpp-exceptions.md` |
 | `[INT3] lifted code reached a debug trap` | The same thing seen one step later, when the throw helper was not identified. MSVC puts a trap after any call it thinks cannot return |
 | A hang with `[ICALL] target 0x... is not code` repeating | A skipped indirect call returns eax = 0, which is also S_OK, so a COM-shaped loop never exits. The runtime says so after 100,000 skips; `RECOMP_ICALL_SPIN_FATAL=1` stops there. Try `py -3 -m tools.seed_from_log` on the log |
+| Fault at a host address more than 4 GB past the guest arena's base (`g_xbox_mem_offset`, 0 on Windows), which no 32-bit guest address can reach | The compiler widened a guest address to 64 bits through signed-overflow UB in lifted arithmetic. Look at the faulting function's lifted C for a signed multiply/add/negate feeding a `MEM`; the lifter must emit it as `uint32_t` (see "Lifted code wraps" under Pipeline). Check the source was built with `-fwrapv` (`compile_commands.json`) |
 | A signed quantity is never negative — an axis saturates, a delta only grows, an abs is a no-op | A lifter sign-extension gap. `movsx r32, bp` was lifted as a zero extension until 20 Sep 2026, because `_lift_movsx`'s register list was missing `bp`/`sp` and the unmatched case fell through to the plain (zero-extended) read. Grep the generated C for `= LO16(` or `= LO8(` as a whole right-hand side: a bare narrow read where a `SX16`/`SX8` belongs. `movsx` now emits `/* movsx: unhandled source register */` rather than failing silently |
 
 Overrides live in `recomp_manual.c` and are checked before the auto-generated table, so they
