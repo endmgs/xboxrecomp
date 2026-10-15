@@ -29,6 +29,7 @@ been tried against a real router.
 | A hosted session: the host is a learning switch for up to 16 consoles | `src/kernel/xbox_net_udp.c`; checked by `tests/syslink_hub` | `syslink_host`, `syslink_port`, `syslink_code` (`RECOMP_SYSLINK_HOST`, `_PORT`, `_CODE`) |
 | The router asked to forward the host's port (UPnP), and the addresses to give out | `src/net/net_upnp.c`, over `third_party/miniupnp` (miniupnpc 2.3.3) | `syslink_upnp` (`RECOMP_SYSLINK_UPNP`), on by default |
 | The launcher's System Link tab | `src/launcher/launcher.c` | writes the five `syslink*` settings |
+| The internet through a router in the runtime, for Xbox Live (Insignia): DHCP, ARP, UDP out through this PC (the console's own port kept when free), fragments both ways, TCP refused for now | `src/kernel/xbox_net_nat.c`; checked by `tests/net_nat` | `RECOMP_SYSLINK=nat` (`syslink = nat`), `RECOMP_NET_DNS` (`net_dns`, default `46.101.64.175,1.1.1.1`), `RECOMP_NET_LOG=1` |
 | A UDP tunnel in xemu's format | `src/kernel/xbox_net_udp.c` | `RECOMP_SYSLINK=udp`, `RECOMP_SYSLINK_REMOTE=host:port`, `RECOMP_SYSLINK_LOCAL=port`, `RECOMP_SYSLINK_DELAY_MS`, `RECOMP_SYSLINK_LOSS` |
 | Real Diffie-Hellman and triple DES in the kernel | `src/kernel/xbox_crypto_soft.c`, behind `XcModExp`, `XcKeyTable`, `XcBlockCrypt(CBC)`, `XcDESKeyParity`; checked by `tests/crypto_soft` | |
 | `XboxLANKey` from the player | `xbox_NetLanKey` in `xbox_nic.c` | `%APPDATA%\xboxrecomp\keys.ini` `lan_key = ...`, or `RECOMP_XBOX_LAN_KEY` |
@@ -106,6 +107,13 @@ never fault twice. Checked on Apple Silicon with Rainbow Six 3: two copies on
 one Mac, one hosting and one joining 127.0.0.1, exchange XNet's frames both
 ways (1 ms round trip), and `tests/syslink_hub` passes. No match has been
 played across them yet, and no Mac has played a Windows PC yet.
+
+**NAT mode (15 Oct 2026).** `syslink = nat` cables the card to the
+internet instead of to other consoles. Rainbow Six 3 on macOS takes its
+address 17 ms after its first DHCPDISCOVER (10.0.2.15, DNS Insignia's then
+1.1.1.1), probes it by ARP, hears nothing, and carries on. With nothing
+answering it retried for half a minute or more. Its Xbox Live menu has not
+been tried through it yet.
 
 With the card on, `PhyGetLinkState` reports a cable whatever
 `RECOMP_ETHERNET_LINK` says (`xbox_NicCardOn`), so a title that turns the

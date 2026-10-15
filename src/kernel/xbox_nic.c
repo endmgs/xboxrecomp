@@ -612,7 +612,9 @@ static void tunnel_start(void)
         return;
     xbox_NicMacAddress(mac);
     s_nic.tunnel = xbox_NetUdpStart(mac) ? 1 : -1;
-    if (s_nic.tunnel > 0) {
+    /* The LAN key is System Link's; on the internet (nat) it is not used. */
+    if (s_nic.tunnel > 0 &&
+        _stricmp(recomp_config_lookup("RECOMP_SYSLINK", "syslink"), "nat") != 0) {
         uint8_t key[16], zero[16] = { 0 };
         xbox_NetLanKey(key);
         if (memcmp(key, zero, 16) == 0)
@@ -923,8 +925,8 @@ void xbox_NicInit(void *host)
     s_nic.model = link && *link && strcmp(link, "0") != 0 &&
                   _stricmp(link, "off") != 0;
     if (s_nic.model && _stricmp(link, "udp") != 0 && _stricmp(link, "host") != 0 &&
-        _stricmp(link, "join") != 0) {
-        fprintf(stderr, "[NIC] syslink = %s: not host, join or udp; "
+        _stricmp(link, "join") != 0 && _stricmp(link, "nat") != 0) {
+        fprintf(stderr, "[NIC] syslink = %s: not host, join, udp or nat; "
                         "the card stays off\n", link);
         s_nic.model = 0;
     }

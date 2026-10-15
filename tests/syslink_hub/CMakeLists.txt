@@ -3,6 +3,7 @@
 add_executable(test_syslink_hub
     test_syslink_hub.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel/xbox_net_udp.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel/xbox_net_nat.c
 )
 target_include_directories(test_syslink_hub PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel

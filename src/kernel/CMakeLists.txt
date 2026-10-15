@@ -24,6 +24,7 @@ set(KERNEL_SOURCES
     xbox_fault_route.c
     xbox_nic.c
     xbox_net_udp.c
+    xbox_net_nat.c
     xbox_crypto_soft.c
     icall_feedback.c
     exit_trace.c

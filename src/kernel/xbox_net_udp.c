@@ -29,7 +29,11 @@
  *         to the address the join came from, and a ping every two seconds
  *         keeps that way back open.
  *
- *     syslink = host | join | udp | off              [RECOMP_SYSLINK]
+ *   nat   Not a cable to other consoles but to the internet, through a
+ *         router inside the runtime, for Xbox Live (Insignia). See
+ *         xbox_net_nat.c; the card's frames go there instead.
+ *
+ *     syslink = host | join | udp | nat | off        [RECOMP_SYSLINK]
  *     syslink_host = 192.168.1.20 or name[:port]     [RECOMP_SYSLINK_HOST]
  *     syslink_port = 27610                           [RECOMP_SYSLINK_PORT]
  *     syslink_code = <anything>                      [RECOMP_SYSLINK_CODE]
@@ -62,6 +66,7 @@
 #include <string.h>
 
 #include "xbox_net_udp.h"
+#include "xbox_net_nat.h"
 #include "recomp_config.h"
 #include "net_upnp.h"
 
@@ -149,6 +154,7 @@ struct XboxNetLink {
 };
 
 static XboxNetLink *s_link;     /* the one xbox_NetUdpStart opens */
+static XboxNat     *s_nat;      /* or, for syslink = nat, the router */
 
 static void lock(XboxNetLink *l)
 {
@@ -880,6 +886,8 @@ static XboxNetMode mode_from(const char *v)
         return XBOX_NET_HOST;
     if (_stricmp(v, "join") == 0)
         return XBOX_NET_JOIN;
+    if (_stricmp(v, "nat") == 0)
+        return XBOX_NET_NAT;
     return XBOX_NET_OFF;
 }
 
@@ -889,12 +897,25 @@ int xbox_NetUdpStart(const uint8_t own_mac[6])
     const char *v;
     char who[32];
 
-    if (s_link)
+    if (s_link || s_nat)
         return 1;
     memset(&cfg, 0, sizeof cfg);
     cfg.mode = mode_from(recomp_config_lookup("RECOMP_SYSLINK", "syslink"));
     if (cfg.mode == XBOX_NET_OFF)
         return 0;
+    if (cfg.mode == XBOX_NET_NAT) {
+        XboxNatConfig nc;
+        memset(&nc, 0, sizeof nc);
+        if ((v = recomp_config_lookup("RECOMP_NET_DNS", "net_dns")) != NULL)
+            snprintf(nc.dns, sizeof nc.dns, "%s", v);
+        nc.fresh_ports = recomp_config_bool("RECOMP_NET_FRESH_PORTS", NULL, 0);
+        s_nat = xbox_net_nat_open(&nc, own_mac);
+        if (s_nat)
+            fprintf(stderr, "[NET] the card is cabled to the internet, through "
+                            "a router in the runtime (syslink = nat)\n");
+        fflush(stderr);
+        return s_nat != NULL;
+    }
     if ((v = getenv("RECOMP_SYSLINK_DELAY_MS")) != NULL && *v)
         cfg.delay_ms = strtol(v, NULL, 10);
     if ((v = getenv("RECOMP_SYSLINK_LOSS")) != NULL && *v)
@@ -964,22 +985,34 @@ int xbox_NetUdpStart(const uint8_t own_mac[6])
 
 void xbox_NetUdpSend(const uint8_t *frame, uint32_t len)
 {
-    xbox_net_link_send(s_link, frame, len);
+    if (s_nat)
+        xbox_net_nat_send(s_nat, frame, len);
+    else
+        xbox_net_link_send(s_link, frame, len);
 }
 
 uint32_t xbox_NetUdpPeek(uint8_t *out, uint32_t cap)
 {
+    if (s_nat)
+        return xbox_net_nat_peek(s_nat, out, cap);
     return xbox_net_link_peek(s_link, out, cap);
 }
 
 void xbox_NetUdpPop(void)
 {
-    xbox_net_link_pop(s_link);
+    if (s_nat)
+        xbox_net_nat_pop(s_nat);
+    else
+        xbox_net_link_pop(s_link);
 }
 
 void xbox_NetUdpStats(unsigned long *sent, unsigned long *received,
                       unsigned long *dropped)
 {
+    if (s_nat) {
+        xbox_net_nat_stats(s_nat, sent, received, dropped);
+        return;
+    }
     if (sent) *sent = s_link ? s_link->sent : 0;
     if (received) *received = s_link ? s_link->received : 0;
     if (dropped) *dropped = s_link ? s_link->dropped : 0;

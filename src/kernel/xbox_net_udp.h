@@ -45,7 +45,10 @@ typedef enum XboxNetMode {
     XBOX_NET_OFF = 0,
     XBOX_NET_PAIR,      /* "udp": bare frames to one address, xemu's format   */
     XBOX_NET_HOST,      /* "host": the switch every joined console goes through */
-    XBOX_NET_JOIN       /* "join": one console, through a host               */
+    XBOX_NET_JOIN,      /* "join": one console, through a host               */
+    XBOX_NET_NAT        /* "nat": the internet, through a router in the
+                         * runtime (xbox_net_nat.c); xbox_NetUdpStart opens
+                         * that instead of a link */
 } XboxNetMode;
 
 typedef struct XboxNetConfig {
