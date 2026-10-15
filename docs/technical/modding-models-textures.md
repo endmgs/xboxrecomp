@@ -199,6 +199,12 @@ copies of every character in the level (byte-identical to `chr.pak`'s, textures 
 the same global numbers), so a character mod replaces files in every pak that holds
 them, not only in `chr.pak`.
 
+A mod can also carry files that are not disc files, for a title's own hooks to read:
+`xbox_mods_find(rel, out, n)` (`kernel.h`) gives the host path of `<mod>/<rel>` in the
+first `RECOMP_MODS` folder that has it, and that folder's index, or -1. TimeSplitters 2
+reads `<mod>/ts2/characters.ini` through it at start-up to add a playable character
+(split2-recomp `docs/formats/roster.md`).
+
 ### Models
 
 | # | Work item | Route | Days | Kind |

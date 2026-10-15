@@ -582,6 +582,12 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* The first RECOMP_MODS folder holding rel (relative to a mod folder, '/'
+ * separated) as a file: its host path in out, its index returned; -1 if none.
+ * For a mod's own files that are not on the disc, such as a table a title's
+ * hooks read at start-up. */
+int xbox_mods_find(const char *rel, char *out, size_t n);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

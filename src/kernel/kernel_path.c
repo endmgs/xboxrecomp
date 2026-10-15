@@ -684,6 +684,13 @@ translate:
     }
 }
 
+static int mods_is_file(const char *path)
+{
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+#define MODS_SEP '\\'
+
 /* ======================================================================== */
 #else /* !_WIN32  -- POSIX (macOS, Linux) */
 /* ======================================================================== */
@@ -973,4 +980,38 @@ translate:
     }
 }
 
+static int mods_is_file(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+#define MODS_SEP '/'
+
 #endif /* _WIN32 */
+
+/*
+ * A mod's own files, which are not disc files: a table or a setting a title's
+ * hooks read at start-up (TimeSplitters 2 reads <mod>/ts2/characters.ini).
+ * rel is relative to a mod folder, with '/' between its parts. The first
+ * folder in RECOMP_MODS that holds it as a file wins, as for disc files: its
+ * host path goes in out and its index (0 is the first folder) is returned.
+ * -1 when no mod has it, RECOMP_MODS is unset, or out is too small.
+ */
+int xbox_mods_find(const char *rel, char *out, size_t n)
+{
+    if (s_mod_count < 0)
+        mods_init();
+    for (int m = 0; rel && *rel && out && m < s_mod_count; m++) {
+        int len = snprintf(out, n, "%s%c%s", s_mod_dirs[m], MODS_SEP, rel);
+        if (len < 0 || (size_t)len >= n)
+            continue;
+        for (char *p = out + strlen(s_mod_dirs[m]); *p; p++)
+            if (*p == '/' || *p == '\\')
+                *p = MODS_SEP;
+        if (mods_is_file(out))
+            return m;
+    }
+    if (out && n)
+        out[0] = 0;
+    return -1;
+}
