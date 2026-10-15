@@ -371,6 +371,9 @@ void xbox_WatchdogStart(void);
  * increment each and nothing when it is off. */
 void xbox_FpsCountSwap(void);
 void xbox_FpsCountVblank(void);
+/* Frames the title has presented since start (its own Swap or Present, at
+ * the HLE boundary; frame interpolation's extra frames are not counted). */
+long long xbox_FpsSwapCount(void);
 /* RECOMP_WAIT_PROFILE (recomp_fps.c): time a kernel call on the swapping
  * thread; object is the first argument, used for KeWaitForSingleObject. */
 int  xbox_FpsWaitProfileOn(void);

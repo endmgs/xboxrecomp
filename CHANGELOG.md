@@ -11,6 +11,19 @@ For where each title stands today, see the [README](README.md#title-status).
 
 ## October 2026
 
+### Input scripts on the title's frames (branch `feat/ts2-decomp`, 15 Oct)
+- `RECOMP_INPUT_CLOCK=frames` times `RECOMP_INPUT_SEQ` / `RECOMP_INPUT_SEQ_FILE` by the frames
+  the title presents (its own `D3DDevice_Swap` or `Present`, counted at the HLE boundary)
+  instead of the wall clock: a step at t ms fires after t / 16.667 frames, so a script written
+  at 60 fps keeps its meaning however slowly a run goes. A scripted run slowed by a check
+  beside it had fallen behind its script and pressed on the wrong screens. Vblanks were not
+  used: the pump is timed by the host and keeps delivering while the title stalls (25 a second
+  through a stretch the title ran at 11 fps). `wall` stays the
+  default.
+- `RECOMP_INPUT_RECORD` writes times on the same clock when it is on, so a recording made on
+  frames replays on frames to the frame.
+- `xbox_FpsSwapCount()` (`recomp_fps.c`) returns the title's presents so far.
+
 ### Input scripts without a step limit (branch `feat/ts2-decomp`, 14 Oct)
 - `RECOMP_INPUT_SEQ` no longer stops at 1024 steps: the array grows. A recorded play session
   (`RECOMP_INPUT_RECORD`) of six and a half minutes of TimeSplitters 2 was 1250 steps, and its

@@ -210,6 +210,13 @@ native process to (lifted code is mid-flight on real threads with host GPU
 objects behind it), so the script is the save state. Frame dumps
 (`RECOMP_HLE_D3D8_DUMP`, `_MINDRAWS=1`, `_EVERY=300`) show where it got to.
 
+The times are wall-clock milliseconds, so a run slowed by whatever it is
+measuring falls behind its script and a press lands on the wrong screen.
+`RECOMP_INPUT_CLOCK=frames` (Oct 2026) counts presented frames instead, as
+16.667 ms each: the same script, unchanged, then waits for the title. Counted
+at the title's own Swap, not at vblanks, because the vblank pump keeps
+delivering while the title stalls (25 a second through a stretch at 11 fps) (`src/hle/input_host.c` has the rest).
+
 ## Working on two titles
 
     titles/<name>/                    the project: CMakeLists, main.c, recomp_manual.c   (committed)

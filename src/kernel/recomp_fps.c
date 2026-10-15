@@ -18,8 +18,9 @@
  * frame rate swings with what is on screen, so a single window is noise and
  * the mean over the whole run is what two runs should be compared on.
  *
- * Off unless RECOMP_FPS is set; on, it costs one interlocked increment per
- * swap and one per vblank.
+ * The report is off unless RECOMP_FPS is set. The counts are always kept, at
+ * one interlocked increment per swap and one per vblank: the swap count is
+ * also the clock RECOMP_INPUT_CLOCK=frames runs an input script on.
  */
 
 #ifdef _WIN32
@@ -333,6 +334,14 @@ void xbox_FpsCountSwap(void)
             wp_frame_end(d);
     }
     last = v;
+}
+
+/* How many frames the title has presented so far: the clock an input script
+ * runs on under RECOMP_INPUT_CLOCK=frames (src/hle/input_host.c). Counted
+ * whether or not RECOMP_FPS is set. */
+long long xbox_FpsSwapCount(void)
+{
+    return (long long)InterlockedCompareExchange64(&s_swaps, 0, 0);
 }
 
 /* The kernel delivered a vblank to the title's ISR. */

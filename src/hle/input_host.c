@@ -25,6 +25,7 @@
 
 /* <windows.h> on Windows, the POSIX shim (GetTickCount64) elsewhere. */
 #include "platform/xbox_winnt.h"
+#include "xbox_memory_layout.h"     /* xbox_FpsSwapCount */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,87 @@ static struct seq_step *s_seq;
 static int s_seq_cap;
 static int s_seq_count = -1;
 static unsigned long long s_seq_t0;
+static int s_seq_started;
+
+/* RECOMP_INPUT_CLOCK=frames -- what a script's milliseconds are counted on.
+ *
+ * By default (wall) they are the host's wall clock, which is right only while
+ * the title keeps up. Anything that slows it -- a debug switch, a check that
+ * runs beside it, a loaded machine -- lets the script run ahead: a press meant
+ * for the third menu lands on the second, and every step after it is on the
+ * wrong screen. A 200 ms press can also fall wholly inside one slow frame and
+ * never be seen.
+ *
+ * With frames, the clock is the frames the title has presented (its own Swap
+ * or Present, counted at the HLE boundary: xbox_FpsSwapCount), and a step's
+ * time t means "after t / 16.667 frames", so a script written in milliseconds
+ * at 60 fps keeps its meaning however slowly the title runs. Presents, not
+ * vblanks: the vblank pump is timed by the host and keeps delivering while
+ * the title is stalled (a TimeSplitters 2 stretch slowed to 11 fps by a check
+ * still got 25 vblanks a second), so counting vblanks drifts the way the wall
+ * clock does, only less; a present is a frame the title finished. Frame
+ * interpolation's extra frames are host presents and are not counted. What
+ * this cannot see: a title that runs uncapped above 60 fps (the script runs
+ * early, by the same ratio), and one whose logic steps by elapsed vblanks
+ * rather than by frame (when slow it does more per frame, so the script runs
+ * late; late is the safe side for a menu, which waits). While the title
+ * presents nothing, as in a load that blocks, the script waits with it.
+ *
+ * RECOMP_INPUT_RECORD writes times on the same clock, so a session recorded
+ * with frames replays on frames to the frame. RECOMP_FAKE_INPUT stays on the
+ * wall clock: it presses forever and has no screens to stay in step with. */
+static int input_clock_frames(void)
+{
+    static int frames = -1;
+
+    if (frames < 0) {
+        const char *v = getenv("RECOMP_INPUT_CLOCK");
+
+        frames = 0;
+        if (v && strcmp(v, "frames") == 0)
+            frames = 1;
+        else if (v && *v && strcmp(v, "wall") != 0)
+            fprintf(stderr, "  [PAD] RECOMP_INPUT_CLOCK=%s: not 'frames' or 'wall';"
+                    " using the wall clock\n", v);
+        if (frames)
+            fprintf(stderr, "  [PAD] input clock: presented frames, 16.667 ms a frame"
+                    " (RECOMP_INPUT_CLOCK=frames)\n");
+        fflush(stderr);
+    }
+    return frames;
+}
+
+/* Now, in milliseconds, on the clock RECOMP_INPUT_CLOCK chose. Frames are
+ * converted as frames * 1000 / 60, which is monotonic and exact for a
+ * recording replayed on the same clock: the frame a press was recorded on is
+ * the first one whose time reaches it. */
+static unsigned long long input_clock_ms(void)
+{
+    if (input_clock_frames()) {
+        long long f = xbox_FpsSwapCount();
+        return f > 0 ? (unsigned long long)f * 1000ull / 60ull : 0ull;
+    }
+    return GetTickCount64();
+}
+
+/* Under frames, a title whose frames never reach the HLE (no replaced Swap
+ * or Present) would leave the script waiting in silence. Say so once, ten
+ * seconds of wall clock after the clock started without a frame. */
+static void input_clock_check(unsigned long long now, unsigned long long t0,
+                              unsigned long long wall0)
+{
+    static int warned;
+
+    if (warned || !input_clock_frames() || now != t0)
+        return;
+    if (GetTickCount64() - wall0 >= 10000ull) {
+        warned = 1;
+        fprintf(stderr, "  [PAD] RECOMP_INPUT_CLOCK=frames: no frame presented in 10 s since"
+                " the first pad read, so the input clock has not moved (does the title's"
+                " Swap or Present reach the HLE?)\n");
+        fflush(stderr);
+    }
+}
 
 static void seq_parse(const char *env)
 {
@@ -286,14 +368,20 @@ static int seq_owns_pad(void)
 
 static void seq_input(RecompInputGamepad *g)
 {
-    unsigned long long t;
+    static unsigned long long wall0;
+    unsigned long long now, t;
     int i, k;
 
     if (!seq_active())
         return;
-    if (!s_seq_t0)
-        s_seq_t0 = GetTickCount64();
-    t = GetTickCount64() - s_seq_t0;
+    now = input_clock_ms();
+    if (!s_seq_started) {
+        s_seq_started = 1;
+        s_seq_t0 = now;
+        wall0 = GetTickCount64();
+    }
+    input_clock_check(now, s_seq_t0, wall0);
+    t = now - s_seq_t0;
     for (i = 0; i < s_seq_count; i++) {
         if (t < s_seq[i].at || t >= (unsigned long long)s_seq[i].at + s_seq[i].hold)
             continue;
@@ -354,7 +442,9 @@ static void fake_input(RecompInputGamepad *g)
  * A menu path or a walk to a place in a level is quicker to play once than to
  * write by trial, and a script played by hand is one that is known to work.
  * The clock starts at the title's first pad read, as the replay's does, so the
- * same file played back presses at the same moments. Each press is written
+ * same file played back presses at the same moments; under
+ * RECOMP_INPUT_CLOCK=frames the times are presented frames, as milliseconds
+ * at 60 fps, and the file should be replayed on that clock too. Each press is written
  * when it is released, as <ms>:<control>:<hold ms>, comma-separated on one
  * line, so the file is the value RECOMP_INPUT_SEQ wants as it stands. Sticks
  * are recorded as pushed fully one way past half travel, which is all the
@@ -363,7 +453,7 @@ static void fake_input(RecompInputGamepad *g)
  * also running, so a recorded run can start from a scripted menu path. */
 #define RECORD_MIN_HOLD 120u
 static FILE *s_rec;
-static int s_rec_checked;
+static int s_rec_checked, s_rec_started;
 static unsigned long long s_rec_t0, s_rec_down[sizeof FAKE / sizeof FAKE[0]];
 static unsigned char s_rec_on[sizeof FAKE / sizeof FAKE[0]];
 static unsigned long s_rec_steps;
@@ -405,9 +495,12 @@ static void record_input(const RecompInputGamepad *g)
     }
     if (!s_rec)
         return;
-    if (!s_rec_t0)
-        s_rec_t0 = GetTickCount64();
-    t = GetTickCount64() - s_rec_t0;
+    t = input_clock_ms();
+    if (!s_rec_started) {
+        s_rec_started = 1;
+        s_rec_t0 = t;
+    }
+    t -= s_rec_t0;
     for (i = 0; i < (int)(sizeof FAKE / sizeof FAKE[0]); i++) {
         int on;
 

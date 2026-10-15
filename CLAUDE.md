@@ -113,6 +113,12 @@ regenerate with `scripts/regen_title_main.py`.
 which is how a player reports a rendering bug that only happens somewhere specific.
 `RECOMP_INPUT_SEQ` can now hold stick directions (`lstick_up`, `rstick_left`, ...) as well as
 buttons, and `RECOMP_INPUT_LOG=1` prints what the title actually reads from the pad.
+**`RECOMP_INPUT_CLOCK=frames` times a script by the title's progress, not the wall clock**
+(Oct 2026): a step's milliseconds count the frames the title has presented (its own Swap or
+Present at the HLE boundary), as 16.667 ms each, so a script written at 60 fps lands on the
+same screens however slowly a run goes; `RECOMP_INPUT_RECORD` writes on the same clock. Use
+it for any scripted run that is slowed by what it measures. Default `wall`. It runs early on
+a title presenting above 60 fps (uncapped), and waits while the title presents nothing.
 
 **Audio de-sync was dropped sound, not a clock (19 Sep 2026).** The host audio queue held four
 submissions and a DirectSound stream was feeding it a tick's worth at a time against a 400 ms
