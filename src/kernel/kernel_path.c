@@ -472,6 +472,17 @@ int xbox_path_save_dir_utf8(char *out, size_t n)
                                NULL, NULL) > 0;
 }
 
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (!s_initialized || !s_game_dir[0])
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, s_game_dir, -1, out, (int)n,
+                               NULL, NULL) > 0;
+}
+
 /* The host path the last translation produced.
  *
  * A caller that wants to act on the file a title just opened -- playing an FMV
@@ -781,6 +792,17 @@ int xbox_path_save_dir_utf8(char *out, size_t n)
     if (!s_initialized || !s_save_dir[0])
         return 0;
     snprintf(out, n, "%s", s_save_dir);
+    return 1;
+}
+
+int xbox_path_game_dir_utf8(char *out, size_t n)
+{
+    if (!out || n == 0)
+        return 0;
+    out[0] = 0;
+    if (!s_initialized || !s_game_dir[0])
+        return 0;
+    snprintf(out, n, "%s", s_game_dir);
     return 1;
 }
 

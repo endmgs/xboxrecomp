@@ -58,6 +58,7 @@
 #include "xbox_memory_layout.h"
 #include "xbox_nic.h"
 #include "xbox_net_udp.h"
+#include "xbox_console_id.h"
 #include "recomp_config.h"   /* recomp_config_user_dir: keys.ini */
 
 #include "platform/fault_emulate.h"   /* recomp_fault_add_range */
@@ -203,6 +204,15 @@ void xbox_NicMacAddress(uint8_t out[6])
                 fprintf(stderr, "[NET] RECOMP_SYSLINK_MAC=%s is not a unicast "
                                 "address (00:50:F2:12:34:56); ignored\n", env);
         }
+        /* A real console's identity carries its own address, and Xbox Live
+         * knows the console by it. */
+        if (!source) {
+            const XboxConsoleId *id = xbox_ConsoleId();
+            if (id) {
+                memcpy(g_mac, id->mac, 6);
+                source = "the console's EEPROM";
+            }
+        }
         if (!source && have_path && read_identity(path, g_mac)) {
             if (!(g_mac[0] & 1))
                 source = path;
@@ -233,6 +243,8 @@ void xbox_NicMacAddress(uint8_t out[6])
         }
         g_mac_ready = 1;
         format_mac(g_mac, text);
+        if (strcmp(source, "the console's EEPROM") == 0)
+            memcpy(text + 8, ":..", 4);   /* the console's own: prefix only */
         fprintf(stderr, "[NET] Ethernet address %s (%s)\n", text, source);
         fflush(stderr);
     }

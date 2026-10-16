@@ -13,6 +13,7 @@
 #include "xbox_memory_layout.h"   /* xbox_EnvSwitch */
 #include "recomp_config.h"
 #include "xbox_nic.h"
+#include "xbox_console_id.h"
 #include <string.h>
 /* getenv: without <stdlib.h> its pointer is truncated to int. */
 #include <stdlib.h>
@@ -336,9 +337,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     case XC_FACTORY_SERIAL_NUMBER:
         /* Twelve ASCII digits, no terminator. Real consoles encode the plant
-         * and week here; nothing reads it but the dashboard. */
+         * and week here. The player's own console's when there is one
+         * (xbox_console_id.c): Xbox Live names the machine account after it. */
         if (ValueLength >= 12) {
-            memcpy(Value, "100000000000", 12);
+            const XboxConsoleId *id = xbox_ConsoleId();
+            memcpy(Value, id ? id->serial : "100000000000", 12);
             if (Type) *Type = 3;              /* REG_BINARY */
             if (ResultLength) *ResultLength = 12;
         }
@@ -360,10 +363,15 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     }
 
     case XC_FACTORY_ONLINE_KEY:
-        /* Sixteen bytes, per-console, and only Xbox Live uses it. Zeroed
-         * deliberately: there is nothing to authenticate against. */
+        /* Sixteen bytes, per-console, and only Xbox Live uses it: the
+         * machine account is created with it. The player's own console's
+         * when there is one, else zeros. */
         if (ValueLength >= 16) {
-            memset(Value, 0, 16);
+            const XboxConsoleId *id = xbox_ConsoleId();
+            if (id)
+                memcpy(Value, id->online_key, 16);
+            else
+                memset(Value, 0, 16);
             if (Type) *Type = 3;
             if (ResultLength) *ResultLength = 16;
         }

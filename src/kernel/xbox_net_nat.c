@@ -11,6 +11,10 @@
  *     net_dns = 46.101.64.175,1.1.1.1                [RECOMP_NET_DNS]
  *     RECOMP_NET_FRESH_PORTS=1   never try the console's own port on this PC
  *     RECOMP_NET_LOG=1           a line for each new UDP mapping and remote
+ *     RECOMP_NET_PCAP=<file>     every frame between the card and the router,
+ *                                both ways, as a pcap Wireshark opens. It
+ *                                holds the console's sign-in traffic: keep it
+ *                                to yourself.
  *
  * The network behind it is 10.0.2.0/24 (xbox_net_nat.h): the console is
  * given 10.0.2.15, the router is 10.0.2.2, and the DNS servers are handed
@@ -128,6 +132,7 @@ struct XboxNat {
     uint32_t           dns[4];
     int                ndns;
     int                verbose;
+    FILE              *pcap;            /* RECOMP_NET_PCAP; the router thread's */
 
     net_socket         wake;            /* bound to 127.0.0.1, sent to itself */
     struct sockaddr_in wake_to;
@@ -207,6 +212,56 @@ static void say(const XboxNat *n, const char *fmt, ...)
     va_end(ap);
 }
 
+/* pcap (libpcap's own format, microsecond stamps, Ethernet frames). Written
+ * on the router's thread only: every frame either way passes through it. */
+static void pcap_open(XboxNat *n, const char *path)
+{
+    static const uint8_t hdr[24] = {
+        0xD4, 0xC3, 0xB2, 0xA1, 2, 0, 4, 0,   /* magic, version 2.4 */
+        0, 0, 0, 0, 0, 0, 0, 0,               /* zone, accuracy */
+        0xFF, 0xFF, 0, 0, 1, 0, 0, 0          /* snaplen 65535, Ethernet */
+    };
+    n->pcap = fopen(path, "wb");
+    if (!n->pcap) {
+        say(n, "RECOMP_NET_PCAP: cannot write %s", path);
+        return;
+    }
+    fwrite(hdr, 1, sizeof hdr, n->pcap);
+    fflush(n->pcap);
+    say(n, "writing the console's frames to %s", path);
+}
+
+static void pcap_frame(XboxNat *n, const uint8_t *f, uint32_t len)
+{
+    uint8_t rec[16];
+    uint32_t sec, usec;
+    int i;
+#ifdef _WIN32
+    FILETIME ft;
+    unsigned long long t;
+    GetSystemTimeAsFileTime(&ft);
+    t = ((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 10u
+        - 11644473600000000ull;
+    sec = (uint32_t)(t / 1000000u);
+    usec = (uint32_t)(t % 1000000u);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    sec = (uint32_t)ts.tv_sec;
+    usec = (uint32_t)(ts.tv_nsec / 1000);
+#endif
+    if (!n->pcap)
+        return;
+    for (i = 0; i < 4; i++) {
+        rec[i] = (uint8_t)(sec >> (8 * i));
+        rec[4 + i] = (uint8_t)(usec >> (8 * i));
+        rec[8 + i] = rec[12 + i] = (uint8_t)(len >> (8 * i));
+    }
+    fwrite(rec, 1, sizeof rec, n->pcap);
+    fwrite(f, 1, len, n->pcap);
+    fflush(n->pcap);
+}
+
 static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static uint32_t get32(const uint8_t *p)
 {
@@ -260,6 +315,7 @@ static int in_network(uint32_t ip)
 
 static void deliver(XboxNat *n, const uint8_t *frame, uint32_t len)
 {
+    pcap_frame(n, frame, len);
     lock(n);
     if (n->in_count == IN_LEN) {
         n->dropped++;
@@ -737,6 +793,7 @@ static void frame_in(XboxNat *n, const uint8_t *f, uint32_t len)
 {
     if (len < 14)
         return;
+    pcap_frame(n, f, len);
     switch (get16(f + 12)) {
     case ETH_ARP:  arp_in(n, f + 14, len - 14); break;
     case ETH_IPV4: ipv4_in(n, f + 14, len - 14); break;
@@ -883,6 +940,9 @@ XboxNat *xbox_net_nat_open(const XboxNatConfig *cfg, const uint8_t own_mac[6])
     memcpy(n->console_mac, own_mac, 6);
     v = getenv("RECOMP_NET_LOG");
     n->verbose = v && *v && strcmp(v, "0") != 0;
+    v = getenv("RECOMP_NET_PCAP");
+    if (v && *v)
+        pcap_open(n, v);
     if (!parse_dns(n, n->cfg.dns[0] ? n->cfg.dns : XBOX_NAT_DEFAULT_DNS))
         say(n, "no DNS server to hand out: names will not resolve");
     for (i = 0; i < UDP_MAX; i++)
@@ -917,6 +977,8 @@ XboxNat *xbox_net_nat_open(const XboxNatConfig *cfg, const uint8_t own_mac[6])
 
 fail:
     say(n, "the router could not start (no socket or thread): no internet");
+    if (n->pcap)
+        fclose(n->pcap);
     if (n->wake != NET_BAD_SOCKET)
         net_close(n->wake);
     free(n);
@@ -943,6 +1005,8 @@ void xbox_net_nat_close(XboxNat *n)
     for (i = 0; i < UDP_MAX; i++)
         udp_close(&n->udp[i]);
     net_close(n->wake);
+    if (n->pcap)
+        fclose(n->pcap);
     free(n);
 }
 

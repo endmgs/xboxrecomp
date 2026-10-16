@@ -32,6 +32,7 @@
 #include "platform/host_main.h"    /* host_relaunch_self: a quick reboot into this title */
 #include "recomp_config.h"         /* recomp_config_title_id */
 #include "xbox_nic.h"
+#include "xbox_console_id.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -336,8 +337,18 @@ static void kernel_data_init(void)
     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
-    /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
+    /* XboxHDKey (ordinal 323): the player's own console's when its identity
+     * is there (xbox_console_id.c), else zeros. Insignia refuses a console
+     * whose key is zero; titles sign console-bound saves with it. */
+    {
+        const XboxConsoleId *id = xbox_ConsoleId();
+        uint8_t hd_key[16] = { 0 };
+        if (id && id->have_hd_key)
+            memcpy(hd_key, id->hd_key, 16);
+        memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset),
+               hd_key, 16);
+        memcpy(xbox_HDKey, hd_key, 16);
+    }
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
@@ -364,9 +375,14 @@ static void kernel_data_init(void)
      * HalRandGather reads the bytes for entropy. Build the struct and its text
      * inside the kernel data area so both are addressable. */
     {
+        /* The console's own drive when its backup says (EvoX's hddinfo.txt):
+         * the drive belongs with the HDD key, as on the console. */
+        const XboxConsoleId *id = xbox_ConsoleId();
         struct { uint32_t str_off, buf_off; const char *text; } d[] = {
-            { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,  "XBOXRECOMP VIRTUAL HDD" },
-            { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF, "XR0000000000" },
+            { KDATA_DISK_MODEL_STR,  KDATA_DISK_MODEL_BUF,
+              id && id->disk_model[0] ? id->disk_model : "XBOXRECOMP VIRTUAL HDD" },
+            { KDATA_DISK_SERIAL_STR, KDATA_DISK_SERIAL_BUF,
+              id && id->disk_serial[0] ? id->disk_serial : "XR0000000000" },
             /* XeImageFileName (ordinal 326). Declared but never filled in, so
              * its Buffer held whatever was in the page -- Half-Life 2's CRT
              * reads it while working out the running image's path, took the
