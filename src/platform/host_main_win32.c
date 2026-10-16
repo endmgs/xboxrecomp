@@ -138,4 +138,28 @@ int host_relaunch_self(void)
     ExitProcess(0);
 }
 
+int host_launch_other(const char *exe)
+{
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char cmd[MAX_PATH + 3];
+
+    if (!exe || !*exe)
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    snprintf(cmd, sizeof cmd, "\"%s\"", exe);
+    if (!CreateProcessA(exe, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
+        return 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    ExitProcess(0);
+}
+
 #endif /* _WIN32 */

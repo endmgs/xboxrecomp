@@ -264,6 +264,20 @@ int host_relaunch_self(void)
     return 0;                       /* execv returned: it failed */
 }
 
+int host_launch_other(const char *exe)
+{
+    char *args[2];
+
+    if (!exe || !*exe)
+        return 0;
+    fflush(stdout);
+    fflush(stderr);
+    args[0] = (char *)exe;
+    args[1] = NULL;
+    execv(exe, args);
+    return 0;                       /* execv returned: it failed */
+}
+
 int host_main_posix(int argc, char **argv, int (*body)(int argc, char **argv),
                     const host_loop *loop)
 {

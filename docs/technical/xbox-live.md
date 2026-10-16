@@ -104,6 +104,42 @@ image alone). A title asking to sign up with no account on the disk reboots
 to the dashboard (`HalReturnToFirmware`, launch reason 7) and, with none to
 go to, comes back to itself: that is what an empty disk looks like.
 
+## Signing in, measured (Rainbow Six 3, 16 Oct 2026)
+
+Through the router, with the player's console identity and accounts:
+DNS for `AS.XBOXLIVE.COM`, two AS exchanges (machine, then user) and a
+TGS exchange with Insignia all succeed. Insignia's TGS-REP then carries
+`XONLINE_E_LOGON_UPDATE_REQUIRED` (0x80151002): the title needs its
+update. What it took, in order:
+
+- A hard-drive copy's Live block undone (Rainbow Six 3's
+  `scripts/live_unpatch.py`).
+- The EEPROM's block reads answering the EEPROM (XNet reads all of it).
+- `RtlNtStatusToDosError` mapping facility-7 statuses (XNet's "would
+  block", 0x800703E5) on POSIX.
+- XOnline's TGS-REQ body encoder seeded (reached only through its ASN.1
+  encoder table).
+
+## The online updater (`titles/xodash-update`)
+
+On "update required", choosing OK makes the title call its title-update
+routine, which reboots into `\Device\CdRom0;update.xbe` with launch data
+naming the title (type 0, title ID at +4). The dashboard's own updater (the
+5960 `xodash/update.xbe`, "Online Updater Application", title FFFE0000) is
+recompiled in `titles/xodash-update`, its files in `games/xodash-update`
+(the player's own, from their console's C: drive), 25 seeds found by run.
+
+The runtime hands off between recompiled images by a launch map
+(`launch_map` / `RECOMP_LAUNCH_MAP`, `kernel_bridge.c`): an Xbox path's
+tail or a title ID to a host executable, optionally `|` its game folder.
+The launch data page goes along in `RECOMP_LAUNCH_DATA`.
+
+    RECOMP_LAUNCH_MAP="update.xbe=<xodash_update_recomp>|<games/xodash-update>;55530013=<rs3_recomp>|<rs3 game folder>"
+
+Status: Rainbow Six 3 hands off to the recompiled updater with its launch
+data; the updater boots, takes a DHCP lease, and then waits without
+drawing a frame or signing in. That wait is the next thing to find.
+
 ## Next
 
 1. Rainbow Six 3's Xbox Live menu through the router, with `RECOMP_NET_PCAP`:

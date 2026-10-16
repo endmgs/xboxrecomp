@@ -72,6 +72,12 @@ int host_module_range(uintptr_t *lo, uintptr_t *hi);
  * the new image could not be started. */
 int host_relaunch_self(void);
 
+/* The same for another executable: what a console's quick reboot into a
+ * different image (XLaunchNewImage) amounts to, when that image is
+ * recompiled too. exe is the host path; no arguments are passed, and the
+ * current environment (the launch data in it) is. Returns only on failure. */
+int host_launch_other(const char *exe);
+
 /* ---- POSIX: which thread the title runs on --------------------------- */
 
 /* A host's main-thread event loop (src/host's recomp_host_loop_run/_quit).

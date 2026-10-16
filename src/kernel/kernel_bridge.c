@@ -1454,6 +1454,93 @@ static void bridge_HalReturnToFirmware(void)
         fflush(stderr);
     }
 
+    /* A quick reboot into another image (XLaunchNewImage with a path, or a
+     * page naming another title), when that image is recompiled too: the
+     * launch map says which host executable it is, by the Xbox path's end
+     * (file name, or a longer tail) or by title ID:
+     *
+     *   launch_map = update.xbe=/path/xodash_update_recomp;55530013=/path/rs3_recomp|/path/game
+     *                                                   [RECOMP_LAUNCH_MAP]
+     *
+     * An entry may name the image's game folder after a '|'; without one the
+     * launched executable finds its own, and RECOMP_GAME_DIR is cleared.
+     *
+     * Its page goes along in RECOMP_LAUNCH_DATA, as for a relaunch into this
+     * title, and so does the rest of the environment (the save folder, the
+     * console identity, the network). This is how a title hands off to the
+     * dashboard's online updater (XOnlineTitleUpdate) and the updater hands
+     * back. */
+    {
+        uint32_t page = BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+        const char *map = recomp_config_lookup("RECOMP_LAUNCH_MAP", "launch_map");
+
+        if (routine == 2 && page &&
+            (BRIDGE_MEM8(page + 8) != 0 || BRIDGE_MEM32(page + 4) != recomp_config_title_id())) {
+            char xpath[520], key[600], exe[1024], tid[16];
+            const char *e = map;
+            uint32_t i, plen;
+
+            for (i = 0; i < sizeof(xpath) - 1; i++) {
+                uint8_t c = BRIDGE_MEM8(page + 8 + i);
+                if (!c) break;
+                xpath[i] = (char)c;
+            }
+            xpath[i] = 0;
+            plen = i;
+            snprintf(tid, sizeof tid, "%08X", BRIDGE_MEM32(page + 4));
+            exe[0] = 0;
+            while (e && *e && !exe[0]) {
+                const char *semi = strchr(e, ';'), *eq = strchr(e, '=');
+                size_t klen, vlen;
+                if (!eq || (semi && eq > semi)) { e = semi ? semi + 1 : NULL; continue; }
+                klen = (size_t)(eq - e);
+                vlen = semi ? (size_t)(semi - eq - 1) : strlen(eq + 1);
+                if (klen < sizeof key && vlen < sizeof exe) {
+                    memcpy(key, e, klen);
+                    key[klen] = 0;
+                    if ((klen == 8 && _stricmp(key, tid) == 0) ||
+                        (plen >= klen && klen > 0 && _stricmp(xpath + plen - klen, key) == 0)) {
+                        memcpy(exe, eq + 1, vlen);
+                        exe[vlen] = 0;
+                    }
+                }
+                e = semi ? semi + 1 : NULL;
+            }
+            if (exe[0]) {
+                static char hex[2 * 0x1000 + 1];
+                /* "exe|game folder": the image's own files. Without one the
+                 * launched executable finds its game folder itself, so this
+                 * title's RECOMP_GAME_DIR must not follow it there. */
+                char *bar = strchr(exe, '|');
+                if (bar)
+                    *bar++ = 0;
+                for (i = 0; i < 0x1000; i++)
+                    snprintf(hex + 2 * i, 3, "%02X", BRIDGE_MEM8(page + i));
+#ifdef _WIN32
+                SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", hex);
+                SetEnvironmentVariableA("RECOMP_RELAUNCH_COUNT", "0");
+                SetEnvironmentVariableA("RECOMP_GAME_DIR", bar && *bar ? bar : NULL);
+#else
+                setenv("RECOMP_LAUNCH_DATA", hex, 1);
+                setenv("RECOMP_RELAUNCH_COUNT", "0", 1);
+                if (bar && *bar)
+                    setenv("RECOMP_GAME_DIR", bar, 1);
+                else
+                    unsetenv("RECOMP_GAME_DIR");
+#endif
+                fprintf(stderr, "  [KERNEL] HalReturnToFirmware: launching '%s' (title %s)"
+                                " as %s, with its launch data (launch_map)\n",
+                        xpath, tid, exe);
+                fflush(stderr);
+                host_launch_other(exe);
+                fprintf(stderr, "  [KERNEL] could not start %s; exiting instead\n", exe);
+            } else if (xpath[0]) {
+                fprintf(stderr, "  [KERNEL] HalReturnToFirmware: '%s' (title %s) has no"
+                                " recompiled image in launch_map\n", xpath, tid);
+            }
+        }
+    }
+
     /* A quick reboot into the same title. XLaunchNewImage with no path (or
      * the update launcher, as Halo 2 does at its first boot) fills the page
      * with the title's own ID and an empty path and reboots: on a console the
