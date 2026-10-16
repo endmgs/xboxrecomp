@@ -210,13 +210,22 @@ static void kernel_data_init(void)
     /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
      *   +0: USHORT Major (1)
      *   +2: USHORT Minor (0)
-     *   +4: USHORT Build (5849 = XDK version)
-     *   +6: USHORT Qfe (0)
-     */
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
+     *   +4: USHORT Build
+     *   +6: USHORT Qfe
+     *
+     * 1.0.5838.1, the last retail kernel (every 1.6 console runs it). This
+     * was 5849, an XDK build no retail console ever reported, and Xbox Live
+     * sends the kernel version with its sign-in: a version the service does
+     * not know can be answered "update required". RECOMP_XBOX_KERNEL_BUILD
+     * overrides the build. */
+    {
+        const char *b = getenv("RECOMP_XBOX_KERNEL_BUILD");
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) =
+            (uint16_t)(b && *b ? strtoul(b, NULL, 10) : 5838);
+        BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 1;
+    }
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */

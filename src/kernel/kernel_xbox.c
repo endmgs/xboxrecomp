@@ -40,7 +40,7 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
-    .Build = 5849,
+    .Build = 5838,   /* the last retail kernel; kernel_bridge.c says why */
     .Qfe   = 1
 };
 
