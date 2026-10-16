@@ -155,15 +155,39 @@ static BOOL find_game(char *tried, size_t tried_bytes)
     int i;
 
     tried[0] = '\0';
+    /* The updater is launched by the title it updates, from that title's
+     * disc ("\Device\CdRom0;update.xbe"), so on a console its D: is the
+     * title's disc: it reads the disc's files to patch them. The title hands
+     * its RECOMP_GAME_DIR over (launch_map), and that is D: here. The XBE is
+     * always the updater's own, found beside the executable as usual, and
+     * its own files (fonts, sounds) come through C: and Y: -- system_dir,
+     * which defaults to that same folder. */
     if (env && *env) {
-        snprintf(g_game_dir, sizeof g_game_dir, "%s", env);
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", env);
+        char own[MAX_PATH];
+
+        snprintf(own, sizeof own, "%s", env);
+#ifdef _WIN32
+        SetEnvironmentVariableA("RECOMP_GAME_DIR", NULL);
+#else
+        unsetenv("RECOMP_GAME_DIR");
+#endif
+        if (!find_game(tried, tried_bytes))
+            return FALSE;
+        if (!getenv("RECOMP_SYSTEM_DIR")) {
+#ifdef _WIN32
+            SetEnvironmentVariableA("RECOMP_SYSTEM_DIR", g_game_dir);
+#else
+            setenv("RECOMP_SYSTEM_DIR", g_game_dir, 1);
+#endif
+        }
+        snprintf(g_game_dir, sizeof g_game_dir, "%s", own);
         xbox_path_normalize(g_game_dir);
-        xbox_path_normalize(g_xbe_path);
-        if (file_exists(g_xbe_path))
-            return TRUE;
-        snprintf(tried, tried_bytes, "RECOMP_GAME_DIR: %s", g_xbe_path);
-        return FALSE;
+#ifdef _WIN32
+        SetEnvironmentVariableA("RECOMP_GAME_DIR", own);
+#else
+        setenv("RECOMP_GAME_DIR", own, 1);
+#endif
+        return TRUE;
     }
 
 #ifdef __APPLE__

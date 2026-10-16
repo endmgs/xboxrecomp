@@ -586,6 +586,10 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* "\Device\Harddisk0\PartitionN\" (1-5, trailing separator): a volume's
+ * root directory (kernel_path.c). */
+int xbox_path_is_volume_root(const char *xbox_path);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

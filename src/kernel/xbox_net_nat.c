@@ -37,8 +37,13 @@
  *            they go out, and a datagram for it too big for one frame is
  *            split (a Kerberos ticket can be).
  *   ICMP     echo to the router is answered. Nothing else is carried.
- *   TCP      not carried yet: a SYN is answered with a reset, and said once
- *            per port, so a title that needs it fails at once and says so.
+ *   TCP      relayed: the router ends the console's connection itself and
+ *            carries its bytes over a socket of this PC's to the same address
+ *            and port (the dashboard's online updater downloads over HTTP).
+ *            The console's SYN is answered once this PC's connect succeeds,
+ *            or reset when it fails. TCP_MAX connections at once, each with
+ *            TCP_BUF bytes buffered either way; data the console has not
+ *            acknowledged is sent again after TCP_RTO_MS.
  *
  * Threads. A frame from the card arrives in the card's fault handler -- a
  * signal handler on POSIX -- so xbox_net_nat_send only copies it into a
@@ -64,6 +69,8 @@
 typedef SOCKET net_socket;
 #define NET_BAD_SOCKET INVALID_SOCKET
 #define net_close closesocket
+#define NET_WOULD_BLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
+#define NET_SEND_FLAGS 0
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -75,9 +82,17 @@ typedef SOCKET net_socket;
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
 typedef int net_socket;
 #define NET_BAD_SOCKET (-1)
 #define net_close close
+#define NET_WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS)
+#ifdef MSG_NOSIGNAL
+#define NET_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define NET_SEND_FLAGS 0
+#endif
 #endif
 
 #define OUT_LEN      64          /* frames from the card, not yet handled   */
@@ -90,6 +105,10 @@ typedef int net_socket;
 #define IP_PAYLOAD   1480u       /* in one 1514-byte frame                  */
 #define LEASE_S      86400u
 #define DNS_LINES    48          /* names asked for, said; then quiet       */
+#define TCP_MAX      8           /* TCP connections carried at once         */
+#define TCP_BUF      65536u      /* bytes buffered each way, per connection */
+#define TCP_RTO_MS   400u        /* unacknowledged data is sent again       */
+#define TCP_IDLE_MS  300000u
 
 #define ETH_IPV4 0x0800u
 #define ETH_ARP  0x0806u
@@ -110,6 +129,34 @@ typedef struct NatUdp {
     uint16_t           host_port;       /* bound on this PC */
     unsigned long long last;
 } NatUdp;
+
+/* A console TCP connection, relayed over a socket of this PC's. Sequence
+ * numbers toward the console are ours (iss, una, nxt); from it, rcv_nxt.
+ * tx holds what the PC's socket gave, from sequence tx_seq, until the
+ * console acknowledges it; rx holds what the console sent, until the PC's
+ * socket takes it. */
+typedef struct NatTcp {
+    int                used;
+    int                connecting;      /* this PC's connect not done yet */
+    net_socket         sock;
+    uint32_t           console_ip, remote_ip;
+    uint16_t           console_port, remote_port;
+    uint32_t           iss, una, nxt, rcv_nxt;
+    int                syn_acked;
+    uint32_t           wnd;             /* the console's window */
+    uint32_t           mss;             /* the console's, or 536 */
+    uint8_t           *tx;
+    uint32_t           tx_seq, tx_len;
+    uint8_t           *rx;
+    uint32_t           rx_len;
+    int                host_eof;        /* this PC's side has finished */
+    int                fin_sent, fin_acked;
+    uint32_t           fin_seq;
+    int                console_fin;     /* the console has finished */
+    int                shut_wr;         /* passed on to this PC's socket */
+    unsigned long long last, progress;
+    unsigned long      bytes_in, bytes_out;
+} NatTcp;
 
 typedef struct Frag {
     int                used;
@@ -147,8 +194,7 @@ struct XboxNat {
     uint16_t           ip_id;
     int                leased;
     long               dns_lines;
-    uint16_t           tcp_said[16];    /* ports a refusal was said for */
-    int                tcp_nsaid;
+    NatTcp             tcp[TCP_MAX];
     unsigned long      sent, received, dropped;
 
     uint8_t            scratch[65536 + 8];   /* the router thread's own */
@@ -667,34 +713,390 @@ static void udp_in(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uin
 
 /* ---- TCP and ICMP ------------------------------------------------------ */
 
-/* A reset for a SYN: the connection is refused at once, rather than the
- * title waiting out its retries. */
-static void tcp_in(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uint32_t plen)
+/* Sequence comparisons, modulo 2^32. */
+static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
+static int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+
+static void tcp_segment(XboxNat *n, NatTcp *c, uint32_t seq, uint8_t flags,
+                        const uint8_t *data, uint32_t len)
+{
+    uint8_t *t = n->scratch;
+    uint32_t hl = (flags & 0x02) ? 24u : 20u;   /* an MSS option on a SYN */
+    uint32_t room = TCP_BUF - c->rx_len;
+
+    memset(t, 0, hl);
+    put16(t, c->remote_port);
+    put16(t + 2, c->console_port);
+    put32(t + 4, seq);
+    put32(t + 8, c->rcv_nxt);
+    t[12] = (uint8_t)((hl / 4u) << 4);
+    t[13] = flags;
+    put16(t + 14, room > 65535u ? 65535u : room);
+    if (hl == 24u) {
+        t[20] = 2; t[21] = 4;
+        put16(t + 22, IP_PAYLOAD - 20u);
+    }
+    if (len)
+        memcpy(t + hl, data, len);
+    put16(t + 16, fold(sum16(t, hl + len, pseudo(c->remote_ip, c->console_ip, IP_TCP, hl + len))));
+    deliver_ip(n, n->console_mac, IP_TCP, c->remote_ip, c->console_ip, t, hl + len);
+}
+
+/* A reset for a segment that belongs to no connection, as RFC 793 says. */
+static void tcp_reset_for(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uint32_t len)
 {
     uint8_t t[20];
-    uint16_t dport;
-    char s[16];
-    int i, said = 0;
+    uint8_t fl = p[13];
+    uint32_t dlen = len - (uint32_t)(p[12] >> 4) * 4u;
 
-    if (plen < 20 || !(p[13] & 0x02) || (p[13] & 0x14))   /* SYN, not ACK/RST */
+    if (fl & 0x04)
         return;
-    dport = get16(p + 2);
-    for (i = 0; i < n->tcp_nsaid; i++)
-        said |= n->tcp_said[i] == dport;
-    if (!said) {
-        if (n->tcp_nsaid < (int)(sizeof n->tcp_said / sizeof n->tcp_said[0]))
-            n->tcp_said[n->tcp_nsaid++] = dport;
-        say(n, "TCP to %s port %u is not carried yet: refused",
-            ip_text(dst, s, sizeof s), dport);
-    }
     memset(t, 0, sizeof t);
-    put16(t, dport);
+    put16(t, get16(p + 2));
     put16(t + 2, get16(p));
-    put32(t + 8, get32(p + 4) + 1u);      /* ack their SYN */
+    if (fl & 0x10) {
+        put32(t + 4, get32(p + 8));
+        t[13] = 0x04;
+    } else {
+        put32(t + 8, get32(p + 4) + dlen + ((fl & 0x02) ? 1u : 0u) + ((fl & 0x01) ? 1u : 0u));
+        t[13] = 0x14;
+    }
     t[12] = 5u << 4;
-    t[13] = 0x14;                         /* RST, ACK */
     put16(t + 16, fold(sum16(t, 20, pseudo(dst, src, IP_TCP, 20))));
     deliver_ip(n, n->console_mac, IP_TCP, dst, src, t, sizeof t);
+}
+
+static void tcp_close(XboxNat *n, NatTcp *c, const char *why)
+{
+    char s[16];
+
+    if (!c->used)
+        return;
+    if (why && n->verbose)
+        say(n, "TCP %s:%u (console port %u): %s, %lu bytes out, %lu in",
+            ip_text(c->remote_ip, s, sizeof s), c->remote_port, c->console_port, why,
+            c->bytes_out, c->bytes_in);
+    if (c->sock != NET_BAD_SOCKET)
+        net_close(c->sock);
+    free(c->tx);
+    free(c->rx);
+    memset(c, 0, sizeof *c);
+    c->sock = NET_BAD_SOCKET;
+}
+
+static void tcp_abort(XboxNat *n, NatTcp *c, const char *why)
+{
+    if (c->syn_acked || !c->connecting)
+        tcp_segment(n, c, c->nxt, 0x14, NULL, 0);   /* RST, ACK */
+    tcp_close(n, c, why);
+}
+
+/* Send what the console's window allows: the SYN-ACK until it is
+ * acknowledged, then data, then a FIN once this PC's side has finished. */
+static void tcp_pump(XboxNat *n, NatTcp *c)
+{
+    if (c->connecting)
+        return;
+    if (!c->syn_acked) {
+        if (c->nxt == c->iss) {
+            tcp_segment(n, c, c->iss, 0x12, NULL, 0);   /* SYN, ACK */
+            c->nxt = c->iss + 1u;
+        }
+        return;
+    }
+    for (;;) {
+        uint32_t off = c->nxt - c->tx_seq;
+        uint32_t inflight = c->nxt - c->una;
+        uint32_t len;
+
+        if (off >= c->tx_len || inflight >= c->wnd)
+            break;
+        len = c->tx_len - off;
+        if (len > c->mss)
+            len = c->mss;
+        if (len > c->wnd - inflight)
+            len = c->wnd - inflight;
+        tcp_segment(n, c, c->nxt, 0x18, c->tx + off, len);   /* PSH, ACK */
+        c->nxt += len;
+    }
+    if (c->host_eof && !c->fin_sent && c->nxt == c->tx_seq + c->tx_len) {
+        c->fin_seq = c->nxt;
+        tcp_segment(n, c, c->nxt, 0x11, NULL, 0);           /* FIN, ACK */
+        c->nxt++;
+        c->fin_sent = 1;
+    }
+}
+
+/* What the console sent, to this PC's socket. */
+static void tcp_flush_rx(XboxNat *n, NatTcp *c)
+{
+    while (c->rx_len && !c->connecting) {
+        int r = (int)send(c->sock, (const char *)c->rx, (int)c->rx_len, NET_SEND_FLAGS);
+        if (r <= 0) {
+            if (r < 0 && NET_WOULD_BLOCK())
+                return;
+            tcp_abort(n, c, "this PC's socket refused the console's data");
+            return;
+        }
+        memmove(c->rx, c->rx + r, c->rx_len - (uint32_t)r);
+        c->rx_len -= (uint32_t)r;
+        c->bytes_out += (unsigned long)r;
+        c->last = now_ms();
+        /* The window it opens is worth saying. */
+        tcp_segment(n, c, c->nxt, 0x10, NULL, 0);
+    }
+    if (!c->rx_len && c->console_fin && !c->shut_wr) {
+        shutdown(c->sock, 1);                               /* SHUT_WR / SD_SEND */
+        c->shut_wr = 1;
+    }
+}
+
+static NatTcp *tcp_find(XboxNat *n, uint32_t remote, uint16_t rport, uint16_t cport)
+{
+    int i;
+    for (i = 0; i < TCP_MAX; i++)
+        if (n->tcp[i].used && n->tcp[i].remote_ip == remote &&
+            n->tcp[i].remote_port == rport && n->tcp[i].console_port == cport)
+            return &n->tcp[i];
+    return NULL;
+}
+
+static void tcp_open(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uint32_t len)
+{
+    NatTcp *c = NULL;
+    struct sockaddr_in a;
+    uint32_t hl = (uint32_t)(p[12] >> 4) * 4u, i;
+    char s[16];
+    int r;
+
+    for (i = 0; i < TCP_MAX; i++)
+        if (!n->tcp[i].used) {
+            c = &n->tcp[i];
+            break;
+        }
+    if (!c) {
+        say(n, "TCP to %s port %u: %d connections already carried, refused",
+            ip_text(dst, s, sizeof s), get16(p + 2), TCP_MAX);
+        tcp_reset_for(n, src, dst, p, len);
+        return;
+    }
+    memset(c, 0, sizeof *c);
+    c->sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    c->tx = (uint8_t *)malloc(TCP_BUF);
+    c->rx = (uint8_t *)malloc(TCP_BUF);
+    if (c->sock == NET_BAD_SOCKET || !c->tx || !c->rx) {
+        c->used = 1;
+        tcp_close(n, c, NULL);
+        tcp_reset_for(n, src, dst, p, len);
+        return;
+    }
+#ifdef _WIN32
+    {
+        u_long nb = 1;
+        ioctlsocket(c->sock, FIONBIO, &nb);
+    }
+#else
+    fcntl(c->sock, F_SETFL, fcntl(c->sock, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_NOSIGPIPE
+    {
+        int one = 1;
+        setsockopt(c->sock, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    }
+#endif
+#endif
+    c->used = 1;
+    c->connecting = 1;
+    c->console_ip = src;
+    c->console_port = get16(p);
+    c->remote_ip = dst;
+    c->remote_port = get16(p + 2);
+    c->rcv_nxt = get32(p + 4) + 1u;
+    c->iss = (uint32_t)(now_ms() * 2654435761u) ^ ((uint32_t)c->console_port << 16);
+    c->una = c->nxt = c->iss;
+    c->tx_seq = c->iss + 1u;
+    c->wnd = get16(p + 14);
+    c->mss = 536u;
+    for (i = 20; i + 1 < hl && i + 1 < len; ) {           /* the MSS option */
+        uint8_t kind = p[i];
+        if (kind == 0)
+            break;
+        if (kind == 1) {
+            i++;
+            continue;
+        }
+        if (p[i + 1] < 2)
+            break;
+        if (kind == 2 && p[i + 1] == 4 && i + 3 < hl)
+            c->mss = get16(p + i + 2);
+        i += p[i + 1];
+    }
+    if (c->mss > IP_PAYLOAD - 20u)
+        c->mss = IP_PAYLOAD - 20u;
+    c->last = c->progress = now_ms();
+
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(dst);
+    a.sin_port = htons(c->remote_port);
+    r = connect(c->sock, (const struct sockaddr *)&a, (int)sizeof a);
+    if (r != 0 && !NET_WOULD_BLOCK()) {
+        say(n, "TCP to %s port %u: this PC cannot connect, refused",
+            ip_text(dst, s, sizeof s), c->remote_port);
+        tcp_close(n, c, NULL);
+        tcp_reset_for(n, src, dst, p, len);
+        return;
+    }
+    if (n->verbose)
+        say(n, "TCP from the console's port %u to %s:%u: connecting from this PC",
+            c->console_port, ip_text(dst, s, sizeof s), c->remote_port);
+}
+
+/* A segment from the console. */
+static void tcp_in(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uint32_t plen)
+{
+    NatTcp *c;
+    uint32_t hl, seq, ack, dlen;
+    uint8_t fl;
+
+    if (plen < 20)
+        return;
+    hl = (uint32_t)(p[12] >> 4) * 4u;
+    if (hl < 20 || hl > plen)
+        return;
+    fl = p[13];
+    seq = get32(p + 4);
+    ack = get32(p + 8);
+    dlen = plen - hl;
+    c = tcp_find(n, dst, get16(p + 2), get16(p));
+    if (!c) {
+        if ((fl & 0x02) && !(fl & 0x10) && !(fl & 0x04))   /* a new SYN */
+            tcp_open(n, src, dst, p, plen);
+        else
+            tcp_reset_for(n, src, dst, p, plen);
+        return;
+    }
+    c->last = now_ms();
+    if (fl & 0x04) {
+        tcp_close(n, c, "reset by the console");
+        return;
+    }
+    if (fl & 0x02) {                                       /* its SYN again */
+        if (!c->connecting && !c->syn_acked) {
+            c->nxt = c->iss;
+            tcp_pump(n, c);
+        }
+        return;
+    }
+    if (c->connecting)
+        return;
+    if (fl & 0x10) {
+        if (seq_lt(c->una, ack) && seq_le(ack, c->nxt)) {
+            if (!c->syn_acked && seq_le(c->iss + 1u, ack))
+                c->syn_acked = 1;
+            if (seq_lt(c->tx_seq, ack)) {
+                uint32_t done = ack - c->tx_seq;
+                if (done > c->tx_len)
+                    done = c->tx_len;
+                memmove(c->tx, c->tx + done, c->tx_len - done);
+                c->tx_len -= done;
+                c->tx_seq += done;
+            }
+            if (c->fin_sent && ack == c->fin_seq + 1u)
+                c->fin_acked = 1;
+            c->una = ack;
+            c->progress = now_ms();
+        }
+        c->wnd = get16(p + 14);
+    }
+    if (dlen || (fl & 0x01)) {
+        if (seq == c->rcv_nxt) {
+            uint32_t take = dlen, room = TCP_BUF - c->rx_len;
+            if (take > room)
+                take = room;
+            memcpy(c->rx + c->rx_len, p + hl, take);
+            c->rx_len += take;
+            c->rcv_nxt += take;
+            if ((fl & 0x01) && take == dlen && !c->console_fin) {
+                c->rcv_nxt++;
+                c->console_fin = 1;
+            }
+        }
+        tcp_segment(n, c, c->nxt, 0x10, NULL, 0);          /* ACK what we have */
+        tcp_flush_rx(n, c);
+        if (!c->used)
+            return;
+    }
+    tcp_pump(n, c);
+    if (c->fin_acked && c->console_fin && !c->rx_len)
+        tcp_close(n, c, "closed");
+}
+
+/* This PC's socket, from the router's select(). */
+static void tcp_service(XboxNat *n, NatTcp *c, int readable, int writable, int failed)
+{
+    char s[16];
+
+    if (c->connecting) {
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (!writable && !failed)
+            return;
+        if (getsockopt(c->sock, SOL_SOCKET, SO_ERROR, (char *)&err, &el) != 0 || err || failed) {
+            say(n, "TCP to %s port %u: this PC could not connect, refused",
+                ip_text(c->remote_ip, s, sizeof s), c->remote_port);
+            tcp_segment(n, c, c->iss, 0x14, NULL, 0);
+            tcp_close(n, c, NULL);
+            return;
+        }
+        c->connecting = 0;
+        if (n->verbose)
+            say(n, "TCP to %s port %u: connected", ip_text(c->remote_ip, s, sizeof s),
+                c->remote_port);
+        tcp_pump(n, c);
+        return;
+    }
+    if (readable && !c->host_eof) {
+        uint32_t room = TCP_BUF - c->tx_len;
+        if (room) {
+            int r = (int)recv(c->sock, (char *)c->tx + c->tx_len, (int)room, 0);
+            if (r > 0) {
+                c->tx_len += (uint32_t)r;
+                c->bytes_in += (unsigned long)r;
+                c->last = now_ms();
+            } else if (r == 0 || !NET_WOULD_BLOCK()) {
+                c->host_eof = 1;
+            }
+        }
+    }
+    if (writable)
+        tcp_flush_rx(n, c);
+    if (c->used)
+        tcp_pump(n, c);
+}
+
+/* Go back to the oldest unacknowledged byte when the console has said
+ * nothing for a while, and close what has finished or gone quiet. */
+static void tcp_timers(XboxNat *n)
+{
+    unsigned long long now = now_ms();
+    int i;
+
+    for (i = 0; i < TCP_MAX; i++) {
+        NatTcp *c = &n->tcp[i];
+        if (!c->used)
+            continue;
+        if (now - c->last > TCP_IDLE_MS) {
+            tcp_abort(n, c, "idle");
+            continue;
+        }
+        if (!c->connecting && c->una != c->nxt && now - c->progress >= TCP_RTO_MS) {
+            c->nxt = c->una;
+            if (c->fin_sent && c->una == c->fin_seq)
+                c->fin_sent = 0;
+            c->progress = now;
+            tcp_pump(n, c);
+        }
+    }
 }
 
 static void icmp_in(XboxNat *n, uint32_t src, uint32_t dst, const uint8_t *p, uint32_t plen)
@@ -836,12 +1238,14 @@ static void *router_thread(void *arg)
     unsigned long long last_sweep = now_ms();
 
     while (!n->stop) {
-        fd_set rd;
+        fd_set rd, wr, ex;
         struct timeval tv;
         net_socket hi = n->wake;
         int i, r;
 
         FD_ZERO(&rd);
+        FD_ZERO(&wr);
+        FD_ZERO(&ex);
         FD_SET(n->wake, &rd);
         for (i = 0; i < UDP_MAX; i++)
             if (n->udp[i].used) {
@@ -849,9 +1253,25 @@ static void *router_thread(void *arg)
                 if (n->udp[i].sock > hi)
                     hi = n->udp[i].sock;
             }
+        for (i = 0; i < TCP_MAX; i++) {
+            NatTcp *c = &n->tcp[i];
+            if (!c->used)
+                continue;
+            if (c->connecting) {
+                FD_SET(c->sock, &wr);
+                FD_SET(c->sock, &ex);
+            } else {
+                if (!c->host_eof && c->tx_len < TCP_BUF)
+                    FD_SET(c->sock, &rd);
+                if (c->rx_len)
+                    FD_SET(c->sock, &wr);
+            }
+            if (c->sock > hi)
+                hi = c->sock;
+        }
         tv.tv_sec = 0;
-        tv.tv_usec = 100000;
-        r = select((int)hi + 1, &rd, NULL, NULL, &tv);
+        tv.tv_usec = 50000;
+        r = select((int)hi + 1, &rd, &wr, &ex, &tv);
 
         if (r > 0 && FD_ISSET(n->wake, &rd)) {
             char b[64];
@@ -875,6 +1295,14 @@ static void *router_thread(void *arg)
             for (i = 0; i < UDP_MAX; i++)
                 if (n->udp[i].used && FD_ISSET(n->udp[i].sock, &rd))
                     from_internet(n, &n->udp[i]);
+        if (r > 0)
+            for (i = 0; i < TCP_MAX; i++) {
+                NatTcp *c = &n->tcp[i];
+                if (c->used && c->sock != NET_BAD_SOCKET)
+                    tcp_service(n, c, FD_ISSET(c->sock, &rd), FD_ISSET(c->sock, &wr),
+                                FD_ISSET(c->sock, &ex));
+            }
+        tcp_timers(n);
 
         if (now_ms() - last_sweep >= 10000u) {
             unsigned long long now = now_ms();
@@ -947,6 +1375,8 @@ XboxNat *xbox_net_nat_open(const XboxNatConfig *cfg, const uint8_t own_mac[6])
         say(n, "no DNS server to hand out: names will not resolve");
     for (i = 0; i < UDP_MAX; i++)
         n->udp[i].sock = NET_BAD_SOCKET;
+    for (i = 0; i < TCP_MAX; i++)
+        n->tcp[i].sock = NET_BAD_SOCKET;
 
     n->wake = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (n->wake == NET_BAD_SOCKET)
@@ -1004,6 +1434,8 @@ void xbox_net_nat_close(XboxNat *n)
 #endif
     for (i = 0; i < UDP_MAX; i++)
         udp_close(&n->udp[i]);
+    for (i = 0; i < TCP_MAX; i++)
+        tcp_close(n, &n->tcp[i], NULL);
     net_close(n->wake);
     if (n->pcap)
         fclose(n->pcap);

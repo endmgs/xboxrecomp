@@ -136,9 +136,52 @@ The launch data page goes along in `RECOMP_LAUNCH_DATA`.
 
     RECOMP_LAUNCH_MAP="update.xbe=<xodash_update_recomp>|<games/xodash-update>;55530013=<rs3_recomp>|<rs3 game folder>"
 
-Status: Rainbow Six 3 hands off to the recompiled updater with its launch
-data; the updater boots, takes a DHCP lease, and then waits without
-drawing a frame or signing in. That wait is the next thing to find.
+### Running it
+
+RS3's update flow, as a console has it: the title launches the updater
+from its own disc (`d:\update.xbe`), so the updater's D: is the title's
+disc, its own files come from C:, and it installs into the title's
+`E:\TDATA\<id>\$u`, which the title reads at boot. The settings that give
+the recompiled pair that layout, all inherited across the hand-off:
+
+    RECOMP_LAUNCH_MAP = update.xbe=<xodash_update_recomp>|<rs3 game>;55530013=<rs3_recomp>|<rs3 game>
+    RECOMP_HDD_DIR    = <one folder>     E: shared by both (hdd_dir)
+    RECOMP_DISC_XBE   = <rs3 game>/default.bak   what D:\default.xbe reads as (disc_xbe)
+    RECOMP_SYSTEM_DIR = (the updater sets it to its own folder: a copy of
+                        the console's C:, with xboxdash.xbe and xodash\)
+    RECOMP_SYSLINK    = nat
+
+### Measured (16 Oct 2026, macOS)
+
+The whole chain runs: RS3 signs in, is told an update is required, hands
+off on OK; the updater (after YES) signs in, opens Insignia's security
+gateway (51.68.122.14:3074 -- the first working SG connection), downloads
+`/ogx/55530013/0000000100000501.xcp` (title update 0x501, 9,083,651 bytes)
+over TCP, unpacks it into `z:\$t` and installs into `TDATA\55530013\$u`.
+`$u\default.xbe` comes out byte for byte the genuine 0x501 XBE.
+
+It stops at `downloader.xbe`: the update carries it as an 896-byte delta
+(PA19) against the disc's `d:\downloader.xbe`, and a hard-drive copy made
+for a console drops that file (with update.xbe), so the delta has nothing
+to apply to and the hash check fails (ERROR_INVALID_DATA). A console
+running the same copy fails the same way. The disc's downloader.xbe is
+what finishes the install.
+
+What it took in the runtime, each the blocker after the one before:
+
+- D3D: the title's swap callback (`D3DDevice__m_SwapCallback_OFFSET`)
+  raised after each flip. The updater draws nothing until it clears its
+  "frame in flight" flag.
+- `hdd_dir`: one E: for every title; `system_dir`: C: and Y: apart from D:;
+  `disc_xbe`: the disc's own XBE behind D:\default.xbe.
+- A volume root (`PartitionN\`, through a drive link too) is a directory
+  to NtQueryFullAttributesFile.
+- The router carries TCP (`xbox_net_nat.c`): it ends the console's
+  connection and relays it over a socket of this PC's.
+- POSIX: a missing folder on the way is STATUS_OBJECT_PATH_NOT_FOUND (the
+  updater makes folders on ERROR_PATH_NOT_FOUND only); a delete-on-close
+  folder is rmdir'd; an empty search's first answer is STATUS_NO_SUCH_FILE,
+  as FATX gives it (Windows too).
 
 ## Next
 

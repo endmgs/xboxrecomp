@@ -2871,6 +2871,72 @@ static void frame_end_shadow(void)
     }
 }
 
+/* The title's swap callback (D3DDevice_SetSwapCallback), raised once a
+ * frame has been flipped.
+ *
+ * On a console the XDK calls it from its GPU interrupt when the flip takes
+ * effect, with a D3DSWAPDATA saying which swap and which vblank. No GPU here
+ * raises that interrupt, so it never came: the 5960 dashboard's online
+ * updater sets a "frame in flight" flag before every Swap and draws nothing
+ * until its callback clears it, so it showed one frame and then waited
+ * forever. The flip gate has already held this Swap to a vblank by the time
+ * the title's own body returns, so the frame is up and the callback is due.
+ *
+ * The callback is wherever SetSwapCallback stored it in the device; the
+ * offset comes from the title's XDK symbols, so a title whose symbols do not
+ * name it keeps the old behaviour. __cdecl void (D3DSWAPDATA *). */
+HLE_IMPORT_VAR(D3DDevice__m_SwapCallback_OFFSET);
+static void run_swap_callback(void)
+{
+    static uint32_t swaps;
+    static int said_missing;
+    uint32_t device, callback, data;
+    uint32_t saved_esp, saved_eax;
+    recomp_func_t fn;
+
+    swaps++;
+    if (!hle_var_D3D_g_pDevice || !hle_var_D3DDevice__m_SwapCallback_OFFSET)
+        return;
+    device = HLE_MEM32(hle_var_D3D_g_pDevice);
+    if (!device)
+        return;
+    callback = HLE_MEM32(device + hle_var_D3DDevice__m_SwapCallback_OFFSET);
+    if (!callback)
+        return;
+    fn = recomp_lookup(callback);
+    if (!fn)
+        fn = recomp_lookup_manual(callback);
+    if (!fn) {
+        if (!said_missing++)
+            fprintf(stderr, "[HLE-D3D8] swap callback 0x%08X is not in the dispatch "
+                    "table; it does not run\n", callback);
+        return;
+    }
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HLE-D3D8] swap callback 0x%08X (device +0x%X) raised after "
+                    "each flip, as the GPU interrupt would\n",
+                    callback, hle_var_D3DDevice__m_SwapCallback_OFFSET);
+    }
+    saved_esp = g_esp;
+    saved_eax = g_eax;
+    /* D3DSWAPDATA on the guest stack: Swap, SwapVBlank, MissedVBlanks,
+     * TimeUntilSwapVBlank, TimeBetweenSwapVBlanks. */
+    g_esp -= 32;
+    data = g_esp;
+    HLE_MEM32(data + 0) = swaps;
+    HLE_MEM32(data + 4) = swaps;
+    HLE_MEM32(data + 8) = 0;
+    HLE_MEM32(data + 12) = 0;
+    HLE_MEM32(data + 16) = 0;
+    g_esp -= 4; HLE_MEM32(g_esp) = data;
+    g_esp -= 4; HLE_MEM32(g_esp) = 0;        /* return address, popped by its ret */
+    fn();
+    g_esp = saved_esp;
+    g_eax = saved_eax;
+}
+
 HLE_EXPORT(D3DDevice_Swap)
 {
     static int seen;
@@ -2933,6 +2999,7 @@ HLE_EXPORT(D3DDevice_Swap)
         g_swap_last = t2;
         g_swap_timed++;
     }
+    run_swap_callback();
     frame_end_shadow();
 }
 

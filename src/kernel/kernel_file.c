@@ -991,6 +991,12 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
+    /* A volume's root directory (kernel_path.c, xbox_path_is_volume_root). */
+    if (xbox_path_is_volume_root(get_xbox_path(ObjectAttributes))) {
+        memset(FileInformation, 0, sizeof *FileInformation);
+        FileInformation->FileAttributes = 0x10;   /* FILE_ATTRIBUTE_DIRECTORY */
+        return STATUS_SUCCESS;
+    }
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
 
@@ -1019,8 +1025,17 @@ typedef struct {
     HANDLE file_handle;
     HANDLE find_handle;
     BOOL   first_done;
+    BOOL   returned;        /* an entry has come back since the scan began */
     WIN32_FIND_DATAW find_data;
 } DIR_CONTEXT;
+
+/* The end of a search, as FATX says it: a search that has found nothing at
+ * all is STATUS_NO_SUCH_FILE (ERROR_FILE_NOT_FOUND to FindFirstFile), and
+ * only one that has is STATUS_NO_MORE_FILES. FATX has no "." or "..", so an
+ * empty folder's first query is the first case; XAPI's FindFirstFile hands
+ * that on, and the 5960 online updater's recursive delete takes
+ * ERROR_FILE_NOT_FOUND for "empty" and anything else for failure. */
+#define SEARCH_END(returned) ((returned) ? STATUS_NO_MORE_FILES : STATUS_NO_SUCH_FILE)
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
@@ -1124,20 +1139,22 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         } else {
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         }
+        ctx->returned = FALSE;
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+            IoStatusBlock->Status = STATUS_NO_SUCH_FILE;
+            return STATUS_NO_SUCH_FILE;
         }
         ctx->first_done = TRUE;
     } else {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+            NTSTATUS end = SEARCH_END(ctx->returned);
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
             ctx->file_handle = NULL;
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+            IoStatusBlock->Status = end;
+            return end;
         }
     }
 
@@ -1145,13 +1162,15 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     while (!wcscmp(ctx->find_data.cFileName, L".") ||
            !wcscmp(ctx->find_data.cFileName, L"..")) {
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+            NTSTATUS end = SEARCH_END(ctx->returned);
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
             ctx->file_handle = NULL;
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+            IoStatusBlock->Status = end;
+            return end;
         }
     }
+    ctx->returned = TRUE;
 
     entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
@@ -1345,6 +1364,24 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (fd < 0) {
         int e = errno;
         NTSTATUS status = errno_to_status(e);
+        /* A missing folder on the way is "path not found" on NT, and only a
+         * missing last component is "name not found"; open() says ENOENT for
+         * both. Titles branch on the difference: the 5960 online updater
+         * opens each file of a download with FILE_OPEN_IF, and on
+         * ERROR_PATH_NOT_FOUND (3) makes its folders and opens it again, so
+         * told ERROR_FILE_NOT_FOUND (2) for system\r6gameplay.u it gave up. */
+        if (e == ENOENT) {
+            char parent[MAX_PATH];
+            char *slash;
+            struct stat pst;
+            snprintf(parent, sizeof parent, "%s", host_path);
+            slash = strrchr(parent, '/');
+            if (slash && slash != parent) {
+                *slash = 0;
+                if (stat(parent, &pst) != 0 || !S_ISDIR(pst.st_mode))
+                    status = STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+        }
         g_xbox_last_file_error = (uint32_t)e;
         /* A warning, as on Windows: a failed open is how a title decides a
          * volume or asset is missing. */
@@ -1574,9 +1611,26 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             /* POSIX: unlinking an open file removes it on last close -- this
              * matches NT "delete on close" semantics exactly. */
+            /* A folder is removed the same way on NT, if it is empty;
+             * unlink() refuses folders, so it is rmdir() for those. Silently
+             * keeping it made the 5960 online updater's "delete the old $u,
+             * then FILE_CREATE a new one" fail with ERROR_ALREADY_EXISTS. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                struct stat st;
+                if (p && lstat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    if (rmdir(p) != 0) {
+                        NTSTATUS status = (errno == ENOTEMPTY || errno == EEXIST)
+                                        ? (NTSTATUS)0xC0000101L    /* STATUS_DIRECTORY_NOT_EMPTY */
+                                        : errno_to_status(errno);
+                        IoStatusBlock->Status = status;
+                        return status;
+                    }
+                } else if (p && unlink(p) != 0 && errno != ENOENT) {
+                    NTSTATUS status = errno_to_status(errno);
+                    IoStatusBlock->Status = status;
+                    return status;
+                }
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1727,6 +1781,12 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!FileInformation)
         return STATUS_INVALID_PARAMETER;
+    /* A volume's root directory (kernel_path.c, xbox_path_is_volume_root). */
+    if (xbox_path_is_volume_root(get_xbox_path(ObjectAttributes))) {
+        memset(FileInformation, 0, sizeof *FileInformation);
+        FileInformation->FileAttributes = 0x10;   /* FILE_ATTRIBUTE_DIRECTORY */
+        return STATUS_SUCCESS;
+    }
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -1749,7 +1809,12 @@ typedef struct {
     HANDLE handle;
     DIR*   dir;
     char   pattern[64];
+    int    returned;        /* an entry has come back since the scan began */
 } DIR_CONTEXT;
+
+/* The end of a search, as FATX says it: see the Windows backend's
+ * SEARCH_END. */
+#define SEARCH_END(returned) ((returned) ? STATUS_NO_MORE_FILES : STATUS_NO_SUCH_FILE)
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
@@ -1818,10 +1883,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         const char* dpath = w32_handle_path(FileHandle);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
         ctx->dir = opendir(dpath);
+        ctx->returned = 0;
         if (!ctx->dir) {
             LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+            IoStatusBlock->Status = STATUS_NO_SUCH_FILE;
+            return STATUS_NO_SUCH_FILE;
         }
         if (FileName && FileName->Buffer && FileName->Length > 0) {
             USHORT n = FileName->Length;
@@ -1840,17 +1906,20 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     for (;;) {
         de = readdir(ctx->dir);
         if (!de) {
+            NTSTATUS end = SEARCH_END(ctx->returned);
             closedir(ctx->dir);
             ctx->dir = NULL;
             ctx->handle = NULL;
             LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+            IoStatusBlock->Status = end;
+            return end;
         }
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
-        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
+        if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0) {
+            ctx->returned = 1;
             break;
+        }
     }
 
     char full[MAX_PATH];
