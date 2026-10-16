@@ -13,6 +13,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_console_id.h"
 #include "xbox_watchpoint.h"
 #include "recomp_config.h"   /* recomp_config_title_id: per-title cache */
 #include <stdio.h>
@@ -459,6 +460,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
     fprintf(stderr, "[PATH] saves in %ls (%s)\n", s_save_dir, save_source);
     fflush(stderr);
+    /* The console's Xbox Live accounts onto the new disk, from its backup. */
+    {
+        char save[MAX_PATH * 3], image[MAX_PATH * 3 + 32];
+        if (xbox_path_save_dir_utf8(save, sizeof save)) {
+            snprintf(image, sizeof image, "%s\\Partition0.img", save);
+            xbox_console_import_accounts(image);
+        }
+    }
 }
 
 int xbox_path_save_dir_utf8(char *out, size_t n)
@@ -763,6 +772,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir);
     fprintf(stderr, "[PATH] saves in %s (%s)\n", s_save_dir, save_source);
     fflush(stderr);
+    /* The console's Xbox Live accounts onto the new disk, from its backup. */
+    {
+        char image[MAX_PATH + 32];
+        snprintf(image, sizeof image, "%s/Partition0.img", s_save_dir);
+        xbox_console_import_accounts(image);
+    }
 }
 
 /* The host path the last translation produced, for the bridge's .wmv movie

@@ -29,6 +29,10 @@
  * over both. The key in eeprom.bin itself is encrypted with the BIOS's
  * EEPROM key, which is not needed when the decrypted key is given.
  *
+ * And disk.bin, the first 512 KB of the console's drive (EvoX), whose
+ * Xbox Live accounts are copied onto the runtime's disk image once
+ * (xbox_console_import_accounts).
+ *
  * What it changes, when found: the serial, Ethernet address and online key
  * ExQueryNonVolatileSetting answers (kernel_xbox.c), XboxHDKey and the HAL's
  * disk serial and model (kernel_bridge.c), and the card's Ethernet address
@@ -377,4 +381,99 @@ const XboxConsoleId *xbox_ConsoleId(void)
     if (!state)
         state = load(&id) ? 1 : -1;
     return state > 0 ? &id : NULL;
+}
+
+/* ---- the Xbox Live accounts ------------------------------------------- */
+
+#define ACCT_FIRST  8           /* the index */
+#define ACCT_LAST   15
+#define SECTOR      512u
+
+/* What an account sector holds: 0 nothing, 1 the machine account (named
+ * SN.<serial>), 2 a user account. The record starts 0x0C into its sector,
+ * its name at +0x0C, its Kerberos domain at +0x24. */
+static int account_kind(const uint8_t *sec)
+{
+    const uint8_t *rec = sec + 0x0C;
+    uint32_t i;
+
+    for (i = 0; i < SECTOR && !sec[i]; i++)
+        ;
+    if (i == SECTOR)
+        return 0;
+    if (!rec[0x24])
+        return 0;               /* no domain: not an account record */
+    return memcmp(rec + 0x0C, "SN.", 3) == 0 ? 1 : 2;
+}
+
+static int any_account(const uint8_t *area)
+{
+    uint32_t s;
+
+    for (s = ACCT_FIRST + 1; s <= ACCT_LAST; s++)
+        if (account_kind(area + (s - ACCT_FIRST) * SECTOR))
+            return 1;
+    return 0;
+}
+
+void xbox_console_import_accounts(const char *image_path)
+{
+    enum { N = (ACCT_LAST - ACCT_FIRST + 1) * SECTOR };
+    static uint8_t from[N], onto[N];
+    const XboxConsoleId *id = xbox_ConsoleId();
+    const char *mode = recomp_config_lookup("RECOMP_CONSOLE_ACCOUNTS", "console_accounts");
+    int replace = mode && _stricmp(mode, "replace") == 0;
+    int machine = 0, users = 0;
+    char path[1100];
+    uint32_t s;
+    FILE *f;
+    size_t got;
+
+    if (!id || !image_path || (mode && _stricmp(mode, "off") == 0))
+        return;
+    snprintf(path, sizeof path, "%s" SEP "disk.bin", id->dir);
+    f = fopen(path, "rb");
+    if (!f)
+        return;                 /* no drive backup: nothing to bring */
+    got = fseek(f, (long)(ACCT_FIRST * SECTOR), SEEK_SET) == 0 ? fread(from, 1, N, f) : 0;
+    fclose(f);
+    if (got != N || !any_account(from)) {
+        fprintf(stderr, "[XBOX] Xbox Live accounts: none in %s (a backup from "
+                        "before signing up?)\n", path);
+        return;
+    }
+
+    f = fopen(image_path, "r+b");
+    if (!f) {
+        fprintf(stderr, "[XBOX] Xbox Live accounts: cannot open %s\n", image_path);
+        return;
+    }
+    got = fseek(f, (long)(ACCT_FIRST * SECTOR), SEEK_SET) == 0 ? fread(onto, 1, N, f) : 0;
+    if (got == N && any_account(onto) && !replace) {
+        fclose(f);
+        /* The index (sector 8) is the title's to update every run; only
+         * different accounts are worth a word. */
+        if (memcmp(onto + SECTOR, from + SECTOR, N - SECTOR) != 0)
+            fprintf(stderr, "[XBOX] Xbox Live accounts: the disk already has its "
+                            "own, kept (console_accounts = replace takes "
+                            "disk.bin's)\n");
+        return;
+    }
+    if (fseek(f, (long)(ACCT_FIRST * SECTOR), SEEK_SET) != 0 ||
+        fwrite(from, 1, N, f) != N) {
+        fclose(f);
+        fprintf(stderr, "[XBOX] Xbox Live accounts: cannot write %s\n", image_path);
+        return;
+    }
+    fclose(f);
+    for (s = ACCT_FIRST + 1; s <= ACCT_LAST; s++) {
+        int k = account_kind(from + (s - ACCT_FIRST) * SECTOR);
+        machine += k == 1;
+        users += k == 2;
+    }
+    fprintf(stderr, "[XBOX] Xbox Live accounts copied from disk.bin onto the "
+                    "disk (sectors %d-%d): %d machine account, %d user "
+                    "account%s\n", ACCT_FIRST, ACCT_LAST, machine, users,
+            users == 1 ? "" : "s");
+    fflush(stderr);
 }

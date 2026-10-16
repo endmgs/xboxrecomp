@@ -23,7 +23,7 @@ of the game. What it needs from the runtime is what a console gives it:
 | The console's identity | `xbox_console_id.c` | done; `tests/console_id` |
 | The kernel's crypto, exactly | `kernel_crypto.c`, `xbox_crypto_soft.c` | to check, export by export |
 | The kernel's keys from the BIOS (`XboxSignatureKey`, `XePublicKeyData`, `XboxLANKey`) | `kernel_bridge.c` | zeros today |
-| A user account on the disk | the first sectors of the HDD | not yet |
+| A user account on the disk | `Partition0.img`, from the backup | copied; not yet signed in with |
 
 Rainbow Six 3 imports, besides the usual: `ExQueryNonVolatileSetting` (24),
 `XboxHDKey` (323), `XboxSignatureKey` (325), `XboxLANKey` (353),
@@ -80,18 +80,34 @@ one of them.
 
 ## Accounts
 
-From [feudalnate/Original-Xbox-LIVE-Account](https://github.com/feudalnate/Original-Xbox-LIVE-Account):
-an account is a 0x6C-byte record (XUID, gamertag, flags, passcode, Kerberos
-domain and realm, a confounder and an HMAC-SHA1 / triple-DES signature with
-keys in XOnline itself), up to eight of them near the start of the drive.
-One EvoX backup of the first 512 KB (`disk.bin`) held a single record at
-0x120C, the machine account (`SN.<serial>`, domain `xbox.com`, realm
-`PASSPORT.NET`), and no user account.
+XOnline keeps the console's accounts in the hard disk's config area, which
+the runtime backs with `Partition0.img`. Rainbow Six 3 reads sector 8 and
+sector 9 as its network starts. From a backup taken after signing up on
+Insignia (EvoX's `disk.bin`, the drive's first 512 KB):
+
+| Sector | What |
+| --- | --- |
+| 8 | an index the title updates every run |
+| 9 | the machine account: named `SN.<serial>`, domain `insignia.live`, realm `passport.net` |
+| 12 | the user account: the gamertag, domain `insignia.live`, realm `PASSPORT.NET` |
+
+Each record starts 0x0C into its sector (name at +0x0C, Kerberos domain at
++0x24, realm at +0x38), the layout
+[feudalnate/Original-Xbox-LIVE-Account](https://github.com/feudalnate/Original-Xbox-LIVE-Account)
+describes. A backup from before signing up held a machine account from the
+original Xbox Live (domain `xbox.com`) and no user account.
+
+`xbox_console_import_accounts` copies sectors 8 to 15 from `disk.bin` onto
+the disk image when the image has no account yet, and keeps the image's own
+otherwise (`console_accounts = replace` takes the backup's, `off` leaves the
+image alone). A title asking to sign up with no account on the disk reboots
+to the dashboard (`HalReturnToFirmware`, launch reason 7) and, with none to
+go to, comes back to itself: that is what an empty disk looks like.
 
 ## Next
 
 1. Rainbow Six 3's Xbox Live menu through the router, with `RECOMP_NET_PCAP`:
    which names it asks for, and how far the Kerberos exchange gets.
 2. The crypto exports checked against known answers, and the BIOS's keys.
-3. A user account on the disk: copied from the console or xemu.
+3. Sign-in with the account copied from the console.
 4. A local Xombie as a second server to check each step against.

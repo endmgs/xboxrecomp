@@ -27,6 +27,21 @@ typedef struct XboxConsoleId {
  * since the default place is beside the game folder. */
 const XboxConsoleId *xbox_ConsoleId(void);
 
+/* Copy the console's Xbox Live accounts into the runtime's disk image, once.
+ *
+ * XOnline keeps them in the hard disk's config area, which the runtime backs
+ * with Partition0.img: an index in sector 8, the machine account in sector 9
+ * and user accounts after it. EvoX's disk.bin is the first 512 KB of the
+ * console's drive, so a backup taken after signing up carries them. Sectors
+ * 8 to 15 are copied from disk.bin when the image holds no account yet
+ * (sectors 9 to 15 empty); accounts already on the image are kept.
+ *
+ *     console_accounts = import | replace | off      [RECOMP_CONSOLE_ACCOUNTS]
+ *
+ * replace takes disk.bin's even over accounts on the image (a newer backup).
+ * Call after xbox_path_init has made the images. image_path is Partition0.img. */
+void xbox_console_import_accounts(const char *image_path);
+
 /* The checksum the EEPROM's factory and user sections carry: a 64-bit sum of
  * little-endian dwords, folded and complemented. For tests. */
 uint32_t xbox_eeprom_checksum(const uint8_t *data, uint32_t len);
