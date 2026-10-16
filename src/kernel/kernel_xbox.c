@@ -206,6 +206,54 @@ uint32_t xbox_kernel_console_av_standard(void)
     return console_av_region();
 }
 
+/* The block reads: a whole section of the EEPROM at once, rather than one
+ * setting. XNet reads all of it (XC_MAX_ALL) when it starts and derives the
+ * console's network identity from it, so answering zeros there gave it a
+ * console with no serial and no online key while every single-setting query
+ * named the real one. */
+#ifndef STATUS_BUFFER_TOO_SMALL
+#define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xC0000023L)
+#endif
+#define XC_MAX_FACTORY 0x1FF
+#define XC_MAX_ALL     0xFFFF
+
+/* The EEPROM as this console holds it: the player's own when there is one
+ * (xbox_console_id.c), else the made-up console's factory section. Either
+ * way the user settings this runtime answers one by one (language, video,
+ * audio, parental, misc, DVD region: 0x90-0xBF) are laid over it and its
+ * checksum redone, so a block read and the single reads agree. */
+static void console_eeprom(uint8_t ee[256])
+{
+    const XboxConsoleId *id = xbox_ConsoleId();
+    static const struct { ULONG index; uint32_t off; } user[] = {
+        { XC_LANGUAGE, 0x90 }, { XC_VIDEO, 0x94 }, { XC_AUDIO, 0x98 },
+        { XC_P_CONTROL_GAMES, 0x9C }, { XC_P_CONTROL_MOVIES, 0xA4 },
+        { XC_MISC, 0xB8 }, { XC_DVD_REGION, 0xBC },
+    };
+    ULONG v, type, got;
+    size_t i;
+
+    if (id) {
+        memcpy(ee, id->eeprom, 256);
+    } else {
+        memset(ee, 0, 256);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_SERIAL_NUMBER, &type, ee + 0x34, 12, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_ETHERNET_ADDR, &type, ee + 0x40, 6, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_ONLINE_KEY, &type, ee + 0x48, 16, &got);
+        xbox_ExQueryNonVolatileSetting(XC_FACTORY_AV_REGION, &type, &v, 4, &got);
+        memcpy(ee + 0x58, &v, 4);
+        v = xbox_eeprom_checksum(ee + 0x34, 0x2C);
+        memcpy(ee + 0x30, &v, 4);
+    }
+    for (i = 0; i < sizeof user / sizeof user[0]; i++) {
+        v = 0;
+        xbox_ExQueryNonVolatileSetting(user[i].index, &type, &v, 4, &got);
+        memcpy(ee + user[i].off, &v, 4);
+    }
+    v = xbox_eeprom_checksum(ee + 0x64, 0x5C);
+    memcpy(ee + 0x60, &v, 4);
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -214,6 +262,21 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
+
+    if (ValueIndex == XC_MAX_ALL || ValueIndex == XC_MAX_OS ||
+        ValueIndex == XC_MAX_FACTORY) {
+        uint8_t ee[256];
+        uint32_t off = ValueIndex == XC_MAX_ALL ? 0 : ValueIndex == XC_MAX_OS ? 0x60 : 0x30;
+        uint32_t len = ValueIndex == XC_MAX_ALL ? 256 : ValueIndex == XC_MAX_OS ? 0x60 : 0x30;
+
+        if (ResultLength) *ResultLength = len;
+        if (Type) *Type = 3;                      /* REG_BINARY */
+        if (ValueLength < len)
+            return STATUS_BUFFER_TOO_SMALL;
+        console_eeprom(ee);
+        memcpy(Value, ee + off, len);
+        return STATUS_SUCCESS;
+    }
 
     switch (ValueIndex) {
     case XC_LANGUAGE:

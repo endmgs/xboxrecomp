@@ -33,6 +33,7 @@
 #include "recomp_config.h"         /* recomp_config_title_id */
 #include "xbox_nic.h"
 #include "xbox_console_id.h"
+#include <stdarg.h>
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -459,6 +460,10 @@ uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+/* RECOMP_XC_TRACE: the crypto and identity calls (defined with the crypto
+ * bridges, used above them too). */
+static void xc_trace(const char *name, const char *fmt, ...);
 
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
@@ -1376,6 +1381,8 @@ static void bridge_ExQueryNonVolatileSetting(void)
         result_va ? (PULONG)&BRIDGE_MEM32(result_va) : NULL);
 
     g_eax = (uint32_t)st;
+    xc_trace("ExQueryNonVolatile", "index 0x%02X, %u bytes -> 0x%08X",
+             value_index, value_length, (uint32_t)st);
 }
 
 /* HalReturnToFirmware(Routine) - the title asking to reboot or quit.
@@ -6304,15 +6311,65 @@ static void bridge_RtlTimeToTimeFields(void)
     g_eax = 0;
 }
 
+/* ── RECOMP_XC_TRACE=1: the console's crypto and identity, call by call ──
+ *
+ * Xbox Live's client (XOnline, lifted with the title) signs in through the
+ * kernel's crypto and the console's identity, and when it gives up before
+ * sending anything, these calls are the trail: which ran, from where, on
+ * what lengths, and what they answered. Never the data -- it is keys and
+ * sign-in material. A run of the same call from the same place prints once
+ * with a count. RECOMP_XC_TRACE_BUDGET lines (default 3000). */
+static void xc_trace(const char *name, const char *fmt, ...)
+{
+    static int on = -1;
+    static long left;
+    static const char *last_name;
+    static uint32_t last_caller;
+    static unsigned long repeats;
+    uint32_t caller = g_xbox_kernel_caller;
+    va_list ap;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_XC_TRACE");
+        const char *b = getenv("RECOMP_XC_TRACE_BUDGET");
+        on = e && *e && strcmp(e, "0") != 0;
+        left = b && *b ? strtol(b, NULL, 0) : 3000;
+    }
+    if (!on)
+        return;
+    if (name == last_name && caller == last_caller) {
+        repeats++;
+        return;
+    }
+    if (repeats) {
+        fprintf(stderr, "[XC]   ... and %lu more\n", repeats);
+        repeats = 0;
+    }
+    last_name = name;
+    last_caller = caller;
+    if (left <= 0)
+        return;
+    left--;
+    fprintf(stderr, "[XC] %-22s from 0x%08X ", name, caller);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    if (left == 0)
+        fprintf(stderr, "[XC] budget spent (RECOMP_XC_TRACE_BUDGET)\n");
+}
+
 /* ── XcSHAInit / XcSHAUpdate / XcSHAFinal (ordinals 335-337) */
 static void bridge_XcSHAInit(void)
 {
+    xc_trace("XcSHAInit", "");
     xbox_XcSHAInit((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)));
     g_eax = 0;
 }
 
 static void bridge_XcSHAUpdate(void)
 {
+    xc_trace("XcSHAUpdate", "%u bytes", STACK_ARG(2));
     xbox_XcSHAUpdate((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                      (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)),
                      STACK_ARG(2));
@@ -6321,6 +6378,7 @@ static void bridge_XcSHAUpdate(void)
 
 static void bridge_XcSHAFinal(void)
 {
+    xc_trace("XcSHAFinal", "");
     xbox_XcSHAFinal((PXBOX_SHA_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(1)));
     g_eax = 0;
@@ -6329,6 +6387,7 @@ static void bridge_XcSHAFinal(void)
 /* ── XcRC4Key / XcRC4Crypt (ordinals 338-339) */
 static void bridge_XcRC4Key(void)
 {
+    xc_trace("XcRC4Key", "key %u bytes", STACK_ARG(1));
     xbox_XcRC4Key((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                   STACK_ARG(1),
                   (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
@@ -6337,6 +6396,7 @@ static void bridge_XcRC4Key(void)
 
 static void bridge_XcRC4Crypt(void)
 {
+    xc_trace("XcRC4Crypt", "%u bytes", STACK_ARG(1));
     xbox_XcRC4Crypt((PXBOX_RC4_CONTEXT)XBOX_TO_NATIVE(STACK_ARG(0)),
                     STACK_ARG(1),
                     (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
@@ -6346,6 +6406,7 @@ static void bridge_XcRC4Crypt(void)
 /* ── XcHMAC (ordinal 340, 7 args) */
 static void bridge_XcHMAC(void)
 {
+    xc_trace("XcHMAC", "key %u, data %u + %u bytes", STACK_ARG(1), STACK_ARG(3), STACK_ARG(5));
     xbox_XcHMAC((const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
@@ -6356,6 +6417,7 @@ static void bridge_XcHMAC(void)
 /* ── XcDESKeyParity (ordinal 346, 2 args) */
 static void bridge_XcDESKeyParity(void)
 {
+    xc_trace("XcDESKeyParity", "%u bytes", STACK_ARG(1));
     xbox_XcDESKeyParity((PUCHAR)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1));
     g_eax = 0;
 }
@@ -6598,6 +6660,7 @@ static void bridge_MmDeleteKernelStack(void)
 static void bridge_XcPKGetKeyLen(void)
 {
     g_eax = (uint32_t)xbox_XcPKGetKeyLen(XBOX_TO_NATIVE(STACK_ARG(0)));
+    xc_trace("XcPKGetKeyLen", "-> %u (stub)", g_eax);
 }
 
 static void bridge_XcPKDecPrivate(void)
@@ -6610,6 +6673,7 @@ static void bridge_XcPKEncPublic(void)
 {
     g_eax = (uint32_t)xbox_XcPKEncPublic(XBOX_TO_NATIVE(STACK_ARG(0)),
         XBOX_TO_NATIVE(STACK_ARG(1)), XBOX_TO_NATIVE(STACK_ARG(2)));
+    xc_trace("XcPKEncPublic", "-> %u (stub)", g_eax);
 }
 
 static void bridge_XcVerifyPKCS1Signature(void)
@@ -6617,10 +6681,12 @@ static void bridge_XcVerifyPKCS1Signature(void)
     g_eax = (uint32_t)xbox_XcVerifyPKCS1Signature(
         XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)),
         XBOX_TO_NATIVE(STACK_ARG(2)));
+    xc_trace("XcVerifyPKCS1Signature", "key at 0x%08X -> %u (always TRUE)", STACK_ARG(1), g_eax);
 }
 
 static void bridge_XcModExp(void)
 {
+    xc_trace("XcModExp", "%u dwords", STACK_ARG(4));
     g_eax = (uint32_t)xbox_XcModExp((PULONG)XBOX_TO_NATIVE(STACK_ARG(0)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)),
         (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
@@ -6629,6 +6695,7 @@ static void bridge_XcModExp(void)
 
 static void bridge_XcKeyTable(void)
 {
+    xc_trace("XcKeyTable", "cipher %u", STACK_ARG(0));
     xbox_XcKeyTable(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
         (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
     g_eax = 0;
@@ -6636,6 +6703,7 @@ static void bridge_XcKeyTable(void)
 
 static void bridge_XcBlockCrypt(void)
 {
+    xc_trace("XcBlockCrypt", "cipher %u, %s", STACK_ARG(0), STACK_ARG(4) ? "encrypt" : "decrypt");
     xbox_XcBlockCrypt(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
         XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
         STACK_ARG(4));
@@ -6644,6 +6712,8 @@ static void bridge_XcBlockCrypt(void)
 
 static void bridge_XcBlockCryptCBC(void)
 {
+    xc_trace("XcBlockCryptCBC", "cipher %u, %u bytes, %s", STACK_ARG(0), STACK_ARG(1),
+             STACK_ARG(5) ? "encrypt" : "decrypt");
     xbox_XcBlockCryptCBC(STACK_ARG(0), STACK_ARG(1),
         XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
         XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
