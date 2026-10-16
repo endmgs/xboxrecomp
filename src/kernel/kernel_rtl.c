@@ -588,6 +588,16 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
          * that on Windows; a POSIX host has no ntdll, so it is listed. */
         case STATUS_CONFLICTING_ADDRESSES:      return ERROR_INVALID_ADDRESS;
         default: {
+            /* A Win32 error carried in a status (facility 7, FACILITY_WIN32:
+             * 0x8007xxxx as HRESULT_FROM_WIN32 makes it, or 0xC007xxxx) is
+             * that error, as NT answers. XNet's receive passes its "would
+             * block" through here as 0x800703E5 (ERROR_IO_PENDING) and waits
+             * on 997; answered 317, XOnline took the reply it was waiting
+             * for as a failure and gave up on Xbox Live 44 ms before
+             * Insignia's answer arrived. */
+            if ((Status & 0x0FFF0000) == 0x00070000 &&
+                ((Status & 0xF0000000) == 0x80000000 || (Status & 0xF0000000) == 0xC0000000))
+                return (ULONG)Status & 0xFFFFu;
 #ifdef _WIN32
             /* The Xbox kernel's table is NT's, so the host's ntdll holds the
              * right answer for any code not listed above. The comment here
@@ -607,6 +617,21 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
 #endif
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,
                 "RtlNtStatusToDosError: unmapped status 0x%08X", Status);
+            /* Said once per status on stderr too: a title that branches on
+             * the error it gets back (XNet's "would block" is one) takes the
+             * failure path on 317, and that is otherwise invisible. */
+            {
+                static NTSTATUS said[32];
+                static int nsaid;
+                int i, seen = 0;
+                for (i = 0; i < nsaid; i++)
+                    seen |= said[i] == Status;
+                if (!seen && nsaid < 32) {
+                    said[nsaid++] = Status;
+                    fprintf(stderr, "[RTL] RtlNtStatusToDosError: no mapping for "
+                                    "status 0x%08X, answering 317\n", (unsigned)Status);
+                }
+            }
             return ERROR_MR_MID_NOT_FOUND;
         }
     }

@@ -349,33 +349,6 @@ static void kernel_data_init(void)
         memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset),
                hd_key, 16);
         memcpy(xbox_HDKey, hd_key, 16);
-
-        /* XOnline signs each account sector with this key: HMAC-SHA1 of its
-         * first 500 bytes, the first 12 bytes of that kept in its last 12
-         * (Rainbow Six 3, 0x00398E09). So the console's own drive backup
-         * says whether the key is the console's: a key that does not verify
-         * sector 9 there makes the title reject the accounts and give up on
-         * Xbox Live before sending anything. */
-        if (id && id->have_hd_key) {
-            char path[1100];
-            uint8_t sec[512], mac[20];
-            FILE *f;
-            snprintf(path, sizeof path, "%s/disk.bin", id->dir);
-            f = fopen(path, "rb");
-            if (f) {
-                if (fseek(f, 9 * 512, SEEK_SET) == 0 && fread(sec, 1, 512, f) == 512 &&
-                    sec[0x0C + 0x24]) {
-                    xbox_XcHMAC(hd_key, 16, sec, 500, NULL, 0, mac);
-                    fprintf(stderr, "[XBOX] the HDD key %s the console's own account "
-                                    "sectors (disk.bin)%s\n",
-                            memcmp(mac, sec + 500, 12) == 0 ? "verifies" : "does NOT verify",
-                            memcmp(mac, sec + 500, 12) == 0 ? "" :
-                            ": Xbox Live will reject the accounts. Use the HDD key "
-                            "eeprom.bin itself holds (keys.ini hd_key = ...)");
-                }
-                fclose(f);
-            }
-        }
     }
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
@@ -3747,6 +3720,7 @@ static void bridge_RtlNtStatusToDosError(void)
      * the buffer and gave up. The complete table was already written; nothing
      * called it. */
     g_eax = (uint32_t)xbox_RtlNtStatusToDosError((NTSTATUS)STACK_ARG(0));
+    xc_trace("RtlNtStatusToDosError", "0x%08X -> %u", STACK_ARG(0), g_eax);
 }
 
 /* ── File I/O bridge helpers ─────────────────────────────── */
@@ -6320,6 +6294,7 @@ static void bridge_RtlTimeFieldsToTime(void)
 static void bridge_PhyGetLinkState(void)
 {
     g_eax = (uint32_t)xbox_PhyGetLinkState((BOOLEAN)STACK_ARG(0));
+    xc_trace("PhyGetLinkState", "verify %u -> 0x%08X", STACK_ARG(0) & 0xFF, g_eax);
 }
 
 /* ── PhyInitialize (ordinal 253, 2 args) */
@@ -6448,10 +6423,22 @@ static void bridge_XcHMAC(void)
     if (data_len >= 64 && data_va >= 12 && out_va) {
         const uint8_t *out = (const uint8_t *)XBOX_TO_NATIVE(out_va);
         const uint8_t *data = (const uint8_t *)XBOX_TO_NATIVE(data_va);
-        xc_trace("XcHMAC", "key %u, data %u + %u bytes; the 12 before %s, the 8 after %s",
+        /* Fingerprints, not data: the first 4 bytes of SHA-1 of the data,
+         * of the 12 bytes after it, and of the answer's first 12, so a run
+         * can be matched against the disk's sectors without showing them. */
+        XBOX_SHA_CONTEXT c;
+        uint8_t h_data[20], h_after[20], h_out[20];
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, data, data_len); xbox_XcSHAFinal(&c, h_data);
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, data + data_len, 12); xbox_XcSHAFinal(&c, h_after);
+        xbox_XcSHAInit(&c); xbox_XcSHAUpdate(&c, out, 12); xbox_XcSHAFinal(&c, h_out);
+        xc_trace("XcHMAC", "key %u, data %u + %u bytes; the 12 before %s, the 8 after %s "
+                 "[data %02x%02x%02x%02x, after %02x%02x%02x%02x, out %02x%02x%02x%02x, data at 0x%08X]",
                  STACK_ARG(1), data_len, STACK_ARG(5),
                  memcmp(out, data - 12, 12) == 0 ? "MATCH" : "differ",
-                 memcmp(out, data + data_len, 8) == 0 ? "MATCH" : "differ");
+                 memcmp(out, data + data_len, 8) == 0 ? "MATCH" : "differ",
+                 h_data[0], h_data[1], h_data[2], h_data[3],
+                 h_after[0], h_after[1], h_after[2], h_after[3],
+                 h_out[0], h_out[1], h_out[2], h_out[3], data_va);
     } else {
         xc_trace("XcHMAC", "key %u, data %u + %u bytes", STACK_ARG(1), data_len, STACK_ARG(5));
     }
