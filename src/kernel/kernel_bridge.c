@@ -349,6 +349,33 @@ static void kernel_data_init(void)
         memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset),
                hd_key, 16);
         memcpy(xbox_HDKey, hd_key, 16);
+
+        /* XOnline signs each account sector with this key: HMAC-SHA1 of its
+         * first 500 bytes, the first 12 bytes of that kept in its last 12
+         * (Rainbow Six 3, 0x00398E09). So the console's own drive backup
+         * says whether the key is the console's: a key that does not verify
+         * sector 9 there makes the title reject the accounts and give up on
+         * Xbox Live before sending anything. */
+        if (id && id->have_hd_key) {
+            char path[1100];
+            uint8_t sec[512], mac[20];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/disk.bin", id->dir);
+            f = fopen(path, "rb");
+            if (f) {
+                if (fseek(f, 9 * 512, SEEK_SET) == 0 && fread(sec, 1, 512, f) == 512 &&
+                    sec[0x0C + 0x24]) {
+                    xbox_XcHMAC(hd_key, 16, sec, 500, NULL, 0, mac);
+                    fprintf(stderr, "[XBOX] the HDD key %s the console's own account "
+                                    "sectors (disk.bin)%s\n",
+                            memcmp(mac, sec + 500, 12) == 0 ? "verifies" : "does NOT verify",
+                            memcmp(mac, sec + 500, 12) == 0 ? "" :
+                            ": Xbox Live will reject the accounts. Use the HDD key "
+                            "eeprom.bin itself holds (keys.ini hd_key = ...)");
+                }
+                fclose(f);
+            }
+        }
     }
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
@@ -6406,12 +6433,28 @@ static void bridge_XcRC4Crypt(void)
 /* ── XcHMAC (ordinal 340, 7 args) */
 static void bridge_XcHMAC(void)
 {
-    xc_trace("XcHMAC", "key %u, data %u + %u bytes", STACK_ARG(1), STACK_ARG(3), STACK_ARG(5));
+    uint32_t data_va = STACK_ARG(2), data_len = STACK_ARG(3), out_va = STACK_ARG(6);
+
     xbox_XcHMAC((const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
-                (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+                (const UCHAR*)XBOX_TO_NATIVE(data_va), data_len,
                 (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
-                (UCHAR*)XBOX_TO_NATIVE(STACK_ARG(6)));
+                (UCHAR*)XBOX_TO_NATIVE(out_va));
     g_eax = 0;
+    /* A signature check is an HMAC of a record compared with the bytes kept
+     * beside it. Whether the answer matches those bytes (the 12 before the
+     * data, as an account sector keeps them, or the 8 after, as an account
+     * record does) says whether the check will pass -- without printing
+     * either. */
+    if (data_len >= 64 && data_va >= 12 && out_va) {
+        const uint8_t *out = (const uint8_t *)XBOX_TO_NATIVE(out_va);
+        const uint8_t *data = (const uint8_t *)XBOX_TO_NATIVE(data_va);
+        xc_trace("XcHMAC", "key %u, data %u + %u bytes; the 12 before %s, the 8 after %s",
+                 STACK_ARG(1), data_len, STACK_ARG(5),
+                 memcmp(out, data - 12, 12) == 0 ? "MATCH" : "differ",
+                 memcmp(out, data + data_len, 8) == 0 ? "MATCH" : "differ");
+    } else {
+        xc_trace("XcHMAC", "key %u, data %u + %u bytes", STACK_ARG(1), data_len, STACK_ARG(5));
+    }
 }
 
 /* ── XcDESKeyParity (ordinal 346, 2 args) */
