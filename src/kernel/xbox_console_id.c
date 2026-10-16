@@ -51,6 +51,7 @@
 
 #ifdef _WIN32
 #define SEP "\\"
+#define strtok_r strtok_s
 #else
 #include <strings.h>
 #define SEP "/"
@@ -201,6 +202,43 @@ static void read_hddinfo(XboxConsoleId *id, const char *path, const char **key_s
     fclose(f);
 }
 
+/* The folder holding `path`, worked out from the text: "." and ".." are
+ * collapsed as written, so a game folder that is a symlink (game -> the
+ * toolkit's games/<title>) still has the project as its parent, where the
+ * OS, following the link, would say the toolkit's games/. */
+static void lexical_parent(const char *path, char *out, size_t n)
+{
+    char buf[1024], *parts[128], *p, *save = NULL;
+    int count = 0, i, absolute;
+    size_t len;
+
+    snprintf(buf, sizeof buf, "%s", path);
+    for (p = buf; *p; p++)
+        if (*p == '\\')
+            *p = '/';
+    absolute = buf[0] == '/';
+    for (p = strtok_r(buf, "/", &save); p; p = strtok_r(NULL, "/", &save)) {
+        if (strcmp(p, ".") == 0)
+            continue;
+        if (strcmp(p, "..") == 0 && count > 0 && strcmp(parts[count - 1], "..") != 0) {
+            count--;
+            continue;
+        }
+        if (count < (int)(sizeof parts / sizeof parts[0]))
+            parts[count++] = p;
+    }
+    if (count > 0)
+        count--;                          /* the parent */
+    out[0] = 0;
+    len = 0;
+    if (absolute)
+        len += (size_t)snprintf(out, n, "/");
+    for (i = 0; i < count && len < n; i++)
+        len += (size_t)snprintf(out + len, n - len, "%s%s", i ? SEP : "", parts[i]);
+    if (!out[0])
+        snprintf(out, n, ".");
+}
+
 static int find_dir(char *out, size_t n, const char **how)
 {
     const char *v = recomp_config_lookup("RECOMP_CONSOLE_DIR", "console_dir");
@@ -216,7 +254,9 @@ static int find_dir(char *out, size_t n, const char **how)
         return is_dir_with_eeprom(out);
     }
     if (xbox_path_game_dir_utf8(base, sizeof base)) {
-        snprintf(out, n, "%s" SEP ".." SEP "xboxbackup", base);
+        char parent[1024];
+        lexical_parent(base, parent, sizeof parent);
+        snprintf(out, n, "%s" SEP "xboxbackup", parent);
         if (is_dir_with_eeprom(out)) {
             *how = "beside the game folder";
             return 1;
