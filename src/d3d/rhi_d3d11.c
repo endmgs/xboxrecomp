@@ -342,6 +342,19 @@ static int d_device_create(const RhiDeviceDesc *dd)
             g_swap_flags = tries[t].flags;
             g_tearing = (tries[t].flags & D3D11_SC_FLAG_ALLOW_TEARING) != 0;
             fprintf(stderr, "[RHI] d3d11: %s swap chain\n", tries[t].name);
+            {
+                /* Which GPU: on a two-GPU laptop the wrong one is the
+                 * first suspect for stutter. */
+                IDXGIDevice *xd = NULL;
+                IDXGIAdapter *ad = NULL;
+                DXGI_ADAPTER_DESC desc;
+                if (SUCCEEDED(ID3D11Device_QueryInterface(g_dev, &IID_IDXGIDevice, (void **)&xd)) &&
+                    SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad)) &&
+                    SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
+                    fprintf(stderr, "[RHI] d3d11: adapter %ls\n", desc.Description);
+                if (ad) IDXGIAdapter_Release(ad);
+                if (xd) IDXGIDevice_Release(xd);
+            }
             break;
         }
     }
@@ -422,10 +435,44 @@ static void d_swapchain_set_vrr(int on)
     fflush(stderr);
 }
 
+/* Frame pacing, every five seconds: how many presents, the longest gap
+ * between two, and how many gaps ran past 20 ms (a dropped frame at 60).
+ * Stutter shows here as a long worst gap; a slow game as a low count. */
+static void present_stats(void)
+{
+    static LARGE_INTEGER freq, last, window;
+    static unsigned frames, late;
+    static double worst;
+    LARGE_INTEGER now;
+    double gap;
+
+    QueryPerformanceCounter(&now);
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        last = window = now;
+        return;
+    }
+    gap = (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    last = now;
+    frames++;
+    if (gap > worst) worst = gap;
+    if (gap > 20.0) late++;
+    if (now.QuadPart - window.QuadPart >= freq.QuadPart * 5) {
+        double secs = (double)(now.QuadPart - window.QuadPart) / (double)freq.QuadPart;
+        fprintf(stderr, "[PACE] %.1f fps, worst frame %.1f ms, %u over 20 ms, vrr %s\n",
+                frames / secs, worst, late, (g_vrr && g_tearing) ? "on" : "off");
+        fflush(stderr);
+        frames = late = 0;
+        worst = 0.0;
+        window = now;
+    }
+}
+
 static int32_t d_present(uint32_t interval)
 {
     UINT flags = (interval == 0 && g_vrr && g_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
 
+    present_stats();
     return g_swap ? (int32_t)IDXGISwapChain_Present(g_swap, interval, flags) : -1;
 }
 

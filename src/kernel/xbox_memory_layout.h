@@ -77,7 +77,6 @@ extern size_t g_xbox_total_ram;
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
-
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */
@@ -317,6 +316,10 @@ void xbox_MemoryLayoutShutdown(void);
  * Check if an address falls within the Xbox memory map.
  */
 BOOL xbox_IsXboxAddress(uintptr_t address);
+
+/* The end of guest RAM as mapped this run (64 MB, more with xbox_SetMapSize):
+ * the bound for "is this guest pointer real memory". */
+uint32_t xbox_GuestRamTop(void);
 
 /**
  * Get the base pointer for direct memory access.

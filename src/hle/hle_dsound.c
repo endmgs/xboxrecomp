@@ -126,7 +126,7 @@ static int voice_field(uint32_t offset)
  * where MmAllocateContiguousMemory memory lives (xbox_memory_layout.c). */
 static int guest_readable(uint32_t va, uint32_t bytes)
 {
-    if (va >= 0x00010000u && (uint64_t)va + bytes <= g_xbox_total_ram)
+    if (va >= 0x00010000u && (uint64_t)va + bytes <= xbox_GuestRamTop())
         return 1;
     return va >= 0x80000000u && (uint64_t)va + bytes <= 0x80000000ull + 0x04000000ull;
 }

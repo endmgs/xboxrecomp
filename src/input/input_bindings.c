@@ -189,7 +189,16 @@ static const struct { const char *name; int vk; } KEYS[] = {
     { "MINUS", 0xBD }, { "PERIOD", 0xBE }, { "SLASH", 0xBF },
     { "GRAVE", 0xC0 }, { "LBRACKET", 0xDB }, { "BACKSLASH", 0xDC },
     { "RBRACKET", 0xDD }, { "QUOTE", 0xDE },
+    /* GetAsyncKeyState answers for the mouse buttons as for keys. */
+    { "MOUSE1", 0x01 }, { "MOUSE2", 0x02 }, { "MOUSE3", 0x04 },
+    { "MOUSE4", 0x05 }, { "MOUSE5", 0x06 },
+    /* The wheel, as a press per notch: two codes Windows leaves undefined,
+     * answered by wheel_pressed rather than GetAsyncKeyState. */
+    { "WHEELUP", 0x0E }, { "WHEELDOWN", 0x0F },
 };
+
+#define VK_WHEEL_UP   0x0E
+#define VK_WHEEL_DOWN 0x0F
 
 static int control_index(const char *name)
 {
@@ -807,12 +816,73 @@ static int sdl_key_down(int vk)
 }
 #endif
 
+#if defined(_WIN32)
+/* Our window when it is in front, else NULL. GetAsyncKeyState reads the
+ * keyboard whatever is in front, so without this a game left running behind
+ * another window plays itself with every key typed there. Refreshed with
+ * the key cache. */
+static HWND g_focus;
+
+static HWND focused_window(void)
+{
+    HWND w = GetForegroundWindow();
+    DWORD pid = 0;
+
+    if (w)
+        GetWindowThreadProcessId(w, &pid);
+    return pid == GetCurrentProcessId() ? w : NULL;
+}
+#endif
+
+/* Wheel notches waiting to be played to the title, and each one's press.
+ * A notch is a moment, a pad button is a state: a title polling once a
+ * frame needs the button held for a few frames, then let go, to count one
+ * press -- and released between notches, or two read as one. */
+#if defined(_WIN32)
+static volatile LONG g_wheel_pending[2];
+
+void recomp_input_wheel(int delta)
+{
+    if (delta > 0)
+        InterlockedIncrement(&g_wheel_pending[0]);
+    else if (delta < 0)
+        InterlockedIncrement(&g_wheel_pending[1]);
+}
+
+#define WHEEL_PRESS_MS 70u
+#define WHEEL_GAP_MS   50u
+
+static int wheel_pressed(int dir)
+{
+    static unsigned long long until[2], gap[2];
+    unsigned long long now = now_ms();
+
+    if (now < until[dir])
+        return 1;
+    if (now < gap[dir])
+        return 0;
+    if (g_wheel_pending[dir] > 0) {
+        InterlockedDecrement(&g_wheel_pending[dir]);
+        until[dir] = now + WHEEL_PRESS_MS;
+        gap[dir] = until[dir] + WHEEL_GAP_MS;
+        return 1;
+    }
+    return 0;
+}
+#else
+void recomp_input_wheel(int delta) { (void)delta; }
+#endif
+
 static int key_down(KeyCache *kc, int vk)
 {
     (void)kc;
     if (vk <= 0 || vk > 255)
         return 0;
 #if defined(_WIN32)
+    if (!g_focus)
+        return 0;
+    if (vk == VK_WHEEL_UP || vk == VK_WHEEL_DOWN)
+        return wheel_pressed(vk == VK_WHEEL_DOWN);
     if (!g_key_state[vk])
         g_key_state[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
     return g_key_state[vk] == 2;
@@ -828,8 +898,115 @@ static void key_cache_tick(void)
     if (now - g_key_state_at >= KEY_CACHE_TTL_MS) {
         memset(g_key_state, 0, sizeof g_key_state);
         g_key_state_at = now;
+#if defined(_WIN32)
+        g_focus = focused_window();
+#endif
     }
 }
+
+#if defined(_WIN32)
+/* Mouse look: the cursor's travel since the last read, as the right stick,
+ * on the keyboard's port. The cursor is put back in the middle of the window
+ * after each read, hidden and held inside it while the window has the focus.
+ *
+ * A title polls many times a frame, so the travel is taken at most every
+ * MOUSE_READ_MS and the stick holds that value in between; read per poll,
+ * the first poll would see all the travel and the rest none.
+ * RECOMP_MOUSE_SENS: stick (0..255) per pixel of travel in one read.
+ * ponytail: travel -> stick deflection, so the turn speed follows the
+ * title's stick curve; feed the title's camera angles directly if it feels
+ * floaty. */
+#define MOUSE_READ_MS 8u
+
+/* Travel not yet taken by recomp_mouse_take, and whether a title takes it. */
+static volatile LONG g_mouse_dx, g_mouse_dy, g_mouse_direct;
+
+int recomp_mouse_take(int *dx, int *dy)
+{
+    InterlockedExchange(&g_mouse_direct, 1);
+    *dx = (int)InterlockedExchange(&g_mouse_dx, 0);
+    *dy = (int)InterlockedExchange(&g_mouse_dy, 0);
+    return g_focus != NULL;
+}
+
+static void mouse_look(int *rx, int *ry)
+{
+    static unsigned long long at;
+    static int hold_x, hold_y, clipped;
+    static float sens;
+    static HWND hidden;
+    unsigned long long now = now_ms();
+    RECT r;
+    POINT mid, p;
+
+    if (sens == 0.0f) {
+        const char *e = getenv("RECOMP_MOUSE_SENS");
+        sens = e ? (float)atof(e) : 0.0f;
+        if (sens <= 0.0f)
+            sens = 10.0f;
+    }
+    /* Not in front, or Alt held: let the pointer go, so a windowed game
+     * does not hold the mouse hostage. Alt+Tab and a click elsewhere work
+     * as anywhere else; letting Alt go takes it back. */
+    if (!g_focus || (GetAsyncKeyState(VK_MENU) & 0x8000)) {
+        if (clipped) {
+            ClipCursor(NULL);
+            clipped = 0;
+        }
+        if (g_focus && hidden == g_focus) {
+            SetClassLongPtrW(g_focus, GCLP_HCURSOR, (LONG_PTR)LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
+            hidden = NULL;
+        }
+        hold_x = hold_y = 0;
+        return;
+    }
+    if (now - at >= MOUSE_READ_MS) {
+        at = now;
+        if (!GetClientRect(g_focus, &r) || r.right <= 0 || r.bottom <= 0)
+            return;
+        mid.x = r.right / 2;
+        mid.y = r.bottom / 2;
+        ClientToScreen(g_focus, &mid);
+        if (hidden != g_focus) {
+            /* The class cursor: SetCursor would only last until the
+             * window's own thread next answers WM_SETCURSOR. */
+            SetClassLongPtrW(g_focus, GCLP_HCURSOR, 0);
+            hidden = g_focus;
+        }
+        if (!clipped) {
+            /* First read after taking the focus: start from the middle
+             * rather than from wherever the click that gave it landed. */
+            POINT lo = { 0, 0 }, hi = { r.right, r.bottom };
+            RECT clip;
+            ClientToScreen(g_focus, &lo);
+            ClientToScreen(g_focus, &hi);
+            SetRect(&clip, lo.x, lo.y, hi.x, hi.y);
+            ClipCursor(&clip);
+            clipped = 1;
+            SetCursorPos(mid.x, mid.y);
+            return;
+        }
+        GetCursorPos(&p);
+        InterlockedExchangeAdd(&g_mouse_dx, p.x - mid.x);
+        InterlockedExchangeAdd(&g_mouse_dy, mid.y - p.y);   /* up is +y */
+        if (g_mouse_direct) {
+            hold_x = hold_y = 0;
+        } else {
+            hold_x = (int)((float)(p.x - mid.x) * sens);
+            hold_y = (int)((float)(mid.y - p.y) * sens);
+        }
+        SetCursorPos(mid.x, mid.y);
+    }
+    *rx += hold_x;
+    *ry += hold_y;
+}
+#else
+int recomp_mouse_take(int *dx, int *dy)
+{
+    *dx = *dy = 0;
+    return 0;
+}
+#endif
 
 static int axis_value(const RecompPadState *g, int axis)
 {
@@ -951,6 +1128,10 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out)
             break;
         }
     }
+#if defined(_WIN32)
+    if (c->has_key)
+        mouse_look(&axis[AXIS_RX], &axis[AXIS_RY]);
+#endif
     for (i = 0; i < 4; i++) {
         long v;
         if (axis[i] > 255)  axis[i] = 255;

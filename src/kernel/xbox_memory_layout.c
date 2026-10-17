@@ -128,9 +128,7 @@ void xbox_SetTotalRam(size_t bytes)
 void xbox_SetMapSize(size_t bytes)
 {
     g_xbox_map_size = bytes;
-}
-
-/* File mapping handle for the Xbox memory region.
+}/* File mapping handle for the Xbox memory region.
  * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
  * the same physical pages as the base region, so writes to mirror addresses
  * (which wrap modulo 64 MB on real Xbox hardware) correctly modify the
@@ -4401,6 +4399,14 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
         return 0;
     g_reserve_next = base + size;
     return base;
+}
+/* The end of guest RAM as this run maps it: 64 MB, or more with
+ * xbox_SetMapSize. What a guest pointer has to stay below to be real memory;
+ * checking against g_xbox_total_ram instead turned away every buffer a title
+ * put above 64 MB. */
+uint32_t xbox_GuestRamTop(void)
+{
+    return (uint32_t)g_memory_size;
 }
 
 BOOL xbox_IsXboxAddress(uintptr_t address)

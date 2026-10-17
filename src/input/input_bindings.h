@@ -49,6 +49,16 @@ int recomp_bindings_sample(unsigned port, XBOX_GAMEPAD *out);
  * takes it. Nothing happens for a keyboard port or a pad without motors. */
 void recomp_bindings_rumble(unsigned port, unsigned short low, unsigned short high);
 
+/* The mouse's travel in pixels since the last call (x right, y up), for a
+ * title that turns its own camera with it. The first call stops the mouse
+ * driving the right stick: the title has taken it. Returns 0, and no
+ * travel, while the game's window does not have the focus. */
+int recomp_mouse_take(int *dx, int *dy);
+
+/* A WM_MOUSEWHEEL delta from the game's window; each notch becomes one
+ * press of whatever "key:WHEELUP" / "key:WHEELDOWN" is bound to. */
+void recomp_input_wheel(int delta);
+
 #ifdef __cplusplus
 }
 #endif

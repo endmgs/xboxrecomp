@@ -15,6 +15,10 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>   /* GetModuleFileNameA: the portable folder */
 #include <direct.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -185,6 +189,22 @@ static int user_dir(char *out, size_t n)
     if ((o = override_dir(out, n, "")) != 0)
         return o > 0;
 #if defined(_WIN32)
+    /* Portable: an "xboxrecomp" folder beside the executable holds the
+     * settings and bindings instead of %APPDATA%. Also the way around
+     * AppData being redirected per app (MSIX packages: a tool started
+     * from one writes a private copy the player's own launch never sees). */
+    {
+        DWORD len = GetModuleFileNameA(NULL, out, (DWORD)n);
+        char *slash;
+        if (len && len < n && (slash = strrchr(out, '\\')) != NULL &&
+            (size_t)(slash - out) + sizeof "\\xboxrecomp" <= n) {
+            DWORD a;
+            strcpy(slash, "\\xboxrecomp");
+            a = GetFileAttributesA(out);
+            if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
+                return 1;
+        }
+    }
     return dir_from(out, n, "APPDATA", NULL);
 #elif defined(__APPLE__)
     return dir_from(out, n, NULL, "Library/Application Support");

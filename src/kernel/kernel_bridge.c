@@ -868,6 +868,15 @@ static void bridge_MmFreeContiguousMemory(void)
  * NTSTATUS NtAllocateVirtualMemory(PVOID *BaseAddress, ULONG ZeroBits,
  *     PULONG AllocationSize, ULONG AllocationType, ULONG Protect)
  */
+extern uint32_t g_kernel_caller;   /* defined with the dispatcher, below */
+static int vm_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_VM_TRACE", 0);
+    return on;
+}
+
 static void bridge_NtAllocateVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);  /* PVOID* in Xbox VA */
@@ -1029,6 +1038,14 @@ static void bridge_NtAllocateVirtualMemory(void)
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
     if (size_ptr) BRIDGE_MEM32(size_ptr) = size;
 
+    /* RECOMP_VM_TRACE=1: every region of 256 KB or more, with its type and
+     * caller -- "who is holding the heap" in one grep. */
+    if (size >= 0x40000u && vm_trace()) {
+        fprintf(stderr, "[VM] alloc %u type 0x%X -> 0x%08X ret 0x%08X\n",
+                size, alloc_type, xbox_va, g_kernel_caller);
+        fflush(stderr);
+    }
+
     g_eax = 0; /* STATUS_SUCCESS */
 }
 
@@ -1175,6 +1192,11 @@ static void bridge_NtFreeVirtualMemory(void)
             if (legacy)
                 fprintf(stderr, "  [KERNEL] RECOMP_NTFREE_LEGACY: "
                                 "NtFreeVirtualMemory keeps the block\n");
+        }
+        if (vm_trace()) {
+            fprintf(stderr, "[VM] free 0x%08X type 0x%X ret 0x%08X\n", base_va, free_type,
+                    g_kernel_caller);
+            fflush(stderr);
         }
         if (!legacy && (free_type & 0x8000u)) {
             xbox_HeapFree(base_va);

@@ -393,7 +393,7 @@ HLE_EXPORT(XMVPlaybackUpdate)
          * Breakdown pass 0; XGRA passes a local and draws only when it comes
          * back non-zero, so the first picture (at 0 ms) is reported as 1. */
         if (status == XMV_STATUS_NEWFRAME && time_va >= 0x00010000u &&
-            (uint64_t)time_va + 4u <= g_xbox_total_ram)
+            (uint64_t)time_va + 4u <= xbox_GuestRamTop())
             HLE_MEM32(time_va) = pts + 1u;
         if (status == XMV_STATUS_ENDOFFILE && !HLE_MEM32(obj + XMV_OFF_DONE)) {
             HLE_MEM32(obj + XMV_OFF_DONE) = 1u;

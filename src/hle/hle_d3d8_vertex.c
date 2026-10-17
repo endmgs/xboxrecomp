@@ -400,7 +400,7 @@ resync:
 /* Title RAM or the contiguous window. */
 static int guest_readable(uint32_t va, uint64_t bytes)
 {
-    if (va >= 0x00010000u && (uint64_t)va + bytes <= g_xbox_total_ram)
+    if (va >= 0x00010000u && (uint64_t)va + bytes <= xbox_GuestRamTop())
         return 1;
     return va >= CONTIG_BASE && (uint64_t)va + bytes <= (uint64_t)CONTIG_BASE + CONTIG_SIZE;
 }

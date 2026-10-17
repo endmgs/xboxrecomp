@@ -52,6 +52,7 @@
 #include "hle.h"
 #include "xbox_adpcm.h"
 #include "audio_output.h"
+#include "d3d8_subtitle.h"
 
 /* kernel_bridge.c: the dispatch table, for the completion callback. */
 typedef void (*recomp_func_t)(void);
@@ -178,7 +179,7 @@ static void note_caller(const char *what)
 
 static int guest_readable(uint32_t va, uint32_t bytes)
 {
-    if (va >= 0x00010000u && (uint64_t)va + bytes <= g_xbox_total_ram)
+    if (va >= 0x00010000u && (uint64_t)va + bytes <= xbox_GuestRamTop())
         return 1;
     return va >= 0x80000000u && (uint64_t)va + bytes <= 0x80000000ull + 0x04000000ull;
 }
@@ -755,7 +756,13 @@ HLE_EXPORT(CDirectSoundStream_Process)
                 s->iface, p->size, p->data, s->count);
     }
     pump(s, now);
-    unlock();
+    {
+        uint32_t data = p->data, size = p->size;
+        unlock();
+        /* Speech recognised by its sound starts its subtitles. */
+        if (size >= 256u && guest_readable(data, size < 8192u ? size : 8192u))
+            d3d8_subtitle_audio_packet(HLE_PTR(data), size);
+    }
     HLE_RETURN(DS_OK);
 }
 

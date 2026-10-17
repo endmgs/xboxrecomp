@@ -71,6 +71,7 @@
 #include "d3d8_xbox.h"
 #include "d3d8_vsh.h"
 #include "d3d8_overlay.h"
+#include "d3d8_subtitle.h"
 #include "d3d8_movie.h"
 #include "d3d8_xbox_map.h"
 #include "hle_d3d8_record.h"
@@ -285,6 +286,12 @@ static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (wp == '\r')
             return 0;                   /* no beep for Alt+Enter */
         break;
+    case WM_MOUSEWHEEL: {
+        /* input_bindings.c: notches become presses of a bound control. */
+        extern void recomp_input_wheel(int delta);
+        recomp_input_wheel(GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    }
     case WM_SETCURSOR:
         /* The game has no pointer; over a fullscreen picture it is in the way. */
         if (g_shadow_fullscreen && LOWORD(lp) == HTCLIENT) {
@@ -2260,6 +2267,7 @@ static char g_overlay_line[96];
 
 void hle_d3d8_overlay_redraw(void)
 {
+    d3d8_subtitle_draw();
     if (g_overlay_shown)
         d3d8_overlay_draw(g_overlay_line);
 }
@@ -2418,6 +2426,7 @@ static void frame_end_shadow(void)
             g_movie_drawn = 1;
         }
         g_movie_sampled = 0;
+        d3d8_subtitle_draw();            /* part of the picture: in the dumps too */
         shadow_dump_frame();             /* before Present discards the buffer */
         shadow_frame_brightness();       /* likewise: Present discards it */
         if (g_inline_begin_frame > g_inline_begin_max)
