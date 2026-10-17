@@ -806,7 +806,8 @@ static void bridge_NtClose(void)
     }
 
     /* Close real handles but skip fake/synthetic ones */
-    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
+    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u &&
+            (raw_handle & 0xFFFFFFF0u) != 0xDEAD0100u) {   /* symbolic links */
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
             /* Closed here rather than through xbox_NtClose, so the file
@@ -5135,6 +5136,28 @@ static void bridge_NtQueryVolumeInformationFile(void)
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FS_INFORMATION_CLASS)infoclass);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    /* A free-space check decides from this, so the first few are said:
+     * which volume, what class, and the answer. */
+    {
+        static int said;
+        if (said < 12) {
+            said++;
+#ifdef _WIN32
+            fprintf(stderr, "  [FILE] volume query class %u -> 0x%08X", infoclass, g_eax);
+#else
+            {
+                const char *p = w32_handle_path(handle);
+                fprintf(stderr, "  [FILE] volume query class %u on %s -> 0x%08X", infoclass,
+                        p ? p : "?", g_eax);
+            }
+#endif
+            if (infoclass == 3 && g_eax == 0 && length >= 24)   /* FileFsSizeInformation */
+                fprintf(stderr, ": %u total, %u free units of %u x %u bytes",
+                        BRIDGE_MEM32(info_va), BRIDGE_MEM32(info_va + 8),
+                        BRIDGE_MEM32(info_va + 16), BRIDGE_MEM32(info_va + 20));
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 /* ── NtQueryFullAttributesFile (ordinal 210, 2 args = 8 bytes) */
@@ -5203,23 +5226,55 @@ static void bridge_NtQueryDirectoryFile(void)
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
+/* Targets of the symbolic links opened lately, by handle 0xDEAD0100 + slot.
+ * Titles open a link, query it and close it at once. */
+static char s_link_target[16][64];
+static unsigned s_link_next;
+
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
 static void bridge_NtOpenSymbolicLinkObject(void)
 {
     uint32_t handle_va = STACK_ARG(0);
-    /* arg1: POBJECT_ATTRIBUTES - ignored, we return a synthetic handle.
-     * Written raw (untagged) so NtClose recognises it and skips it. */
-    if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0001u;
+    const char *name = bridge_get_xbox_path(STACK_ARG(1));
+    const char *target = NULL;
+    size_t n = name ? strlen(name) : 0;
+
+    /* The link's own target: a title's XFormatUtilityDrive opens \??\Z:,
+     * asks where it points and formats that. Every link used to answer
+     * \Device\CdRom0, so the 5960 online updater, wiping its cache drive at
+     * the end of an install, formatted the DVD drive, failed, and called
+     * the install out of disk space. D: is the DVD drive, as XAPI links it. */
+    if (name)
+        target = xbox_LookupSymbolicLink(name);
+    if (!target && n >= 2 && (name[n - 2] == 'D' || name[n - 2] == 'd') && name[n - 1] == ':')
+        target = "\\Device\\CdRom0";
+    if (!target) {
+        /* A console says STATUS_OBJECT_NAME_NOT_FOUND. Every link answered
+         * \Device\CdRom0 for long enough that a title may lean on it, so a
+         * name the table does not know keeps that answer, and is said. */
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [KERNEL] NtOpenSymbolicLinkObject: '%s' is no link here; "
+                            "answering \\Device\\CdRom0 as before\n", name ? name : "?");
+        target = "\\Device\\CdRom0";
+    }
+    {
+        unsigned slot = s_link_next++ & 15u;
+        snprintf(s_link_target[slot], sizeof s_link_target[slot], "%s", target);
+        /* Written raw (untagged): NtClose knows this range and skips it. */
+        if (handle_va) BRIDGE_MEM32(handle_va) = 0xDEAD0100u | slot;
+    }
     g_eax = STATUS_SUCCESS;
 }
 
 /* ── NtQuerySymbolicLinkObject (ordinal 215, 3 args = 12 bytes) */
 static void bridge_NtQuerySymbolicLinkObject(void)
 {
-    /* uint32_t handle = STACK_ARG(0); */
+    uint32_t handle = STACK_ARG(0);
     uint32_t target_va = STACK_ARG(1);
     uint32_t retlen_va = STACK_ARG(2);
-    const char* target = "\\Device\\CdRom0";
+    const char* target = (handle & 0xFFFFFFF0u) == 0xDEAD0100u
+                       ? s_link_target[handle & 15u] : "\\Device\\CdRom0";
     USHORT len = (USHORT)strlen(target);
 
     if (retlen_va) BRIDGE_MEM32(retlen_va) = (uint32_t)len;

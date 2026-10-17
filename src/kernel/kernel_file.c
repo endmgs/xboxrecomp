@@ -107,6 +107,12 @@ static void ensure_e_root_folder(const char *xbox_path, ULONG disposition)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* A volume that is a folder of this PC's is reported as an Xbox partition,
+ * the size of the E: image (kernel_path.c, s_part_sectors[1]), with no more
+ * free than this PC has: no console volume is hundreds of GB, and a title
+ * that counts 16 KB blocks in 32 bits would overflow on this PC's disk. */
+#define XBOX_FOLDER_VOLUME_BYTES    (0x00465400ull * 512u)
+
 /* A FATX superblock's sectors per cluster, when `head` (the volume's first 12
  * bytes) is one: magic "FATX", volume id, sectors per cluster. 0 otherwise, or
  * for a value no FATX volume has (not a power of two, or above 128 KB). */
@@ -953,8 +959,13 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
-                info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
-                info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
+                ULONGLONG total = total_bytes.QuadPart, avail = free_bytes.QuadPart;
+                if (total > XBOX_FOLDER_VOLUME_BYTES)
+                    total = XBOX_FOLDER_VOLUME_BYTES;
+                if (avail > total)
+                    avail = total;
+                info->TotalAllocationUnits.QuadPart = total / cs;
+                info->AvailableAllocationUnits.QuadPart = avail / cs;
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
@@ -1744,6 +1755,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
+                if (total > XBOX_FOLDER_VOLUME_BYTES)
+                    total = XBOX_FOLDER_VOLUME_BYTES;
+                if (avail > total)
+                    avail = total;
                 info->TotalAllocationUnits.QuadPart = total / cs;
                 info->AvailableAllocationUnits.QuadPart = avail / cs;
             } else {
