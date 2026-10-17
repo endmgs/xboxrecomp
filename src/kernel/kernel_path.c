@@ -113,41 +113,59 @@ static const char *system_dir_setting(void)
     return dir;
 }
 
-/* The file D:\default.xbe reads as, when that is not the game folder's:
+/* Files that stand in for the disc's, path for path:
  *
- *   disc_xbe = <file>                                    [RECOMP_DISC_XBE]
+ *   disc_overlay = <folder>                          [RECOMP_DISC_OVERLAY]
  *
- * A copy of a disc made to run from a console's hard drive has its
+ * A file at <folder>/<path> is what D:\<path> reads as; anything not there
+ * is the game folder's as usual. It is for putting a disc back as it was
+ * shipped. A copy made to run from a console's hard drive has its
  * default.xbe patched (allowed media, the media check, often a Live block)
- * and keeps the disc's as default.bak. A title update is a set of deltas
- * against the disc's files, checked by hash afterwards, so the online
- * updater patching the hard-drive copy's XBE made a file 7 bytes off the
- * update's and gave up with ERROR_INVALID_DATA. A title's launcher points
- * this at default.bak; the updater the title launches inherits it. Only
- * that one file, and only read through D:. NULL when it is not set or the
- * path is another. */
-static const char *disc_xbe_for(const char *xbox_path)
+ * and keeps the disc's as default.bak, and leaves out files the disc has.
+ * A title update is a set of deltas against the disc's files, each checked
+ * by hash, so the online updater patching the hard-drive copy's XBE made a
+ * file 7 bytes off the update's and gave up with ERROR_INVALID_DATA. The
+ * title's launcher sets it; the updater the title launches inherits it.
+ * Read through D: only; nothing is written there. */
+static int disc_overlay_for(const char *xbox_path, char *out, size_t n)
 {
     static int looked;
-    static const char *file;
-    static const char *const names[] = {
-        "\\Device\\CdRom0\\default.xbe", "D:\\default.xbe", "\\??\\D:\\default.xbe",
+    static const char *dir;
+    static const char *const prefixes[] = {
+        "\\Device\\CdRom0\\", "D:\\", "\\??\\D:\\",
     };
-    size_t i;
+    size_t i, k;
 
     if (!looked) {
-        const char *v = recomp_config_lookup("RECOMP_DISC_XBE", "disc_xbe");
+        const char *v = recomp_config_lookup("RECOMP_DISC_OVERLAY", "disc_overlay");
         looked = 1;
-        file = (v && *v) ? v : NULL;
-        if (file)
-            fprintf(stderr, "  [PATH] D:\\default.xbe is %s (disc_xbe)\n", file);
+        dir = (v && *v) ? v : NULL;
+        if (dir)
+            fprintf(stderr, "  [PATH] D: has %s laid over it (disc_overlay)\n", dir);
     }
-    if (!file || !xbox_path)
-        return NULL;
-    for (i = 0; i < sizeof names / sizeof names[0]; i++)
-        if (_stricmp(xbox_path, names[i]) == 0)
-            return file;
-    return NULL;
+    if (!dir || !xbox_path)
+        return 0;
+    for (i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
+        size_t len = strlen(prefixes[i]);
+        const char *rest;
+        FILE *f;
+
+        if (_strnicmp(xbox_path, prefixes[i], len) != 0)
+            continue;
+        rest = xbox_path + len;
+        if (!*rest || strstr(rest, ".."))
+            return 0;
+        snprintf(out, n, "%s/%s", dir, rest);
+        for (k = strlen(dir) + 1; out[k]; k++)
+            if (out[k] == '\\')
+                out[k] = '/';
+        f = fopen(out, "rb");
+        if (!f)
+            return 0;
+        fclose(f);
+        return 1;
+    }
+    return 0;
 }
 
 /* The folder a game-folder rule goes to instead, or NULL: hdd_dir for E:,
@@ -665,11 +683,14 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
 
-    if (disc_xbe_for(xbox_path)) {
-        MultiByteToWideChar(CP_UTF8, 0, disc_xbe_for(xbox_path), -1, host_path_buf, (int)buf_size);
-        fprintf(stderr, "  [PATH] %s -> disc_xbe\n", xbox_path);
-        fflush(stderr);
-        return TRUE;
+    {
+        char over[MAX_PATH];
+        if (disc_overlay_for(xbox_path, over, sizeof over)) {
+            MultiByteToWideChar(CP_UTF8, 0, over, -1, host_path_buf, (int)buf_size);
+            fprintf(stderr, "  [PATH] %s -> disc_overlay\n", xbox_path);
+            fflush(stderr);
+            return TRUE;
+        }
     }
 
     if (xbox_partition_device_path(xbox_path, host_path_buf, buf_size)) {
@@ -993,12 +1014,15 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
 
-    if (disc_xbe_for(xbox_path)) {
-        snprintf(host_path_buf, buf_size, "%s", disc_xbe_for(xbox_path));
-        fprintf(stderr, "  [PATH] %s -> disc_xbe\n", xbox_path);
-        fflush(stderr);
-        xbox_remember_host_path(host_path_buf);
-        return TRUE;
+    {
+        char over[MAX_PATH];
+        if (disc_overlay_for(xbox_path, over, sizeof over)) {
+            snprintf(host_path_buf, buf_size, "%s", over);
+            fprintf(stderr, "  [PATH] %s -> disc_overlay\n", xbox_path);
+            fflush(stderr);
+            xbox_remember_host_path(host_path_buf);
+            return TRUE;
+        }
     }
 
     {
