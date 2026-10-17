@@ -17,6 +17,10 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commdlg.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <wincrypt.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,8 +35,15 @@
 #define LAUNCHER_GAME_EXE "game.exe"
 #endif
 
+/* What the window is called before the game's own files are there to
+ * name it: recomp_add_launcher(... TITLE "..."). */
+#ifndef LAUNCHER_TITLE
+#define LAUNCHER_TITLE "Xbox game"
+#endif
+
 #define WINDOW_W 900
-#define WINDOW_H 800                    /* eight Video rows, their help, the footer */
+#define WINDOW_H 860                    /* nine Video rows, their help, the footer */
+#define PLAY_W   180                    /* wide enough for SELECT ISO */
 
 /* The client area as it really is. On a display at 125% these are not
  * WINDOW_W/H: asking Windows not to scale us and then laying out
@@ -63,6 +74,11 @@ static int            g_widescreen;        /* the row; settings_save applies it 
 
 static Row  g_video_rows[12];
 static int  g_video_count;
+
+/* recomp_add_launcher(... DEV_FILE <path in the game folder>): the title
+ * has a developer mode that a file's being there turns on, and the row
+ * below makes or removes that file. */
+static int  g_dev_mode;
 
 /* ---- input ---- */
 
@@ -172,6 +188,17 @@ static void build_rows(void)
     r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
     r++;
 
+#ifdef LAUNCHER_DEV_FILE
+    r->label = "Developer mode";
+#ifdef LAUNCHER_DEV_HELP
+    r->help  = LAUNCHER_DEV_HELP;
+#else
+    r->help  = "Turn on the game's own developer mode. Parts of it may be unstable.";
+#endif
+    r->kind  = ROW_BOOL; r->ival = &g_dev_mode;
+    r++;
+#endif
+
     g_video_count = (int)(r - g_video_rows);
 }
 
@@ -276,7 +303,7 @@ static int row_can(const Row *r, int delta)
 
 /* ------------------------------------------------------------- the title */
 
-static char g_title_name[128] = "Xbox game";
+static char g_title_name[128] = LAUNCHER_TITLE;
 static uint32_t g_title_id;
 static char g_xbe_found[MAX_PATH];      /* empty: the game's files were not found */
 
@@ -319,7 +346,7 @@ static int read_cert(const char *xbe)
         }
         while (k > 0 && g_title_name[k - 1] == ' ') k--;
         g_title_name[k] = '\0';
-        if (!k) snprintf(g_title_name, sizeof g_title_name, "Xbox game");
+        if (!k) snprintf(g_title_name, sizeof g_title_name, "%s", LAUNCHER_TITLE);
     }
     if (!GetFullPathNameA(xbe, sizeof g_xbe_found, g_xbe_found, NULL))
         snprintf(g_xbe_found, sizeof g_xbe_found, "%s", xbe);
@@ -501,6 +528,56 @@ static void settings_load(void)
     }
 }
 
+#ifdef LAUNCHER_DEV_FILE
+/* The developer-mode file, in the folder the game's XBE was found in. */
+static int dev_file_path(char *out, size_t n)
+{
+    char *p;
+
+    if (!g_xbe_found[0])
+        return 0;
+    snprintf(out, n, "%s", g_xbe_found);
+    p = strrchr(out, '\\');
+    if (!p)
+        return 0;
+    snprintf(p + 1, n - (size_t)(p + 1 - out), "%s", LAUNCHER_DEV_FILE);
+    for (p = out; *p; p++)
+        if (*p == '/') *p = '\\';
+    return 1;
+}
+#endif
+
+static void dev_load(void)
+{
+#ifdef LAUNCHER_DEV_FILE
+    char path[MAX_PATH];
+
+    g_dev_mode = dev_file_path(path, sizeof path) &&
+                 GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#endif
+}
+
+static void dev_save(void)
+{
+#ifdef LAUNCHER_DEV_FILE
+    char path[MAX_PATH], dir[MAX_PATH], *slash;
+    FILE *f;
+
+    if (!dev_file_path(path, sizeof path))
+        return;
+    if (!g_dev_mode) {
+        DeleteFileA(path);
+        return;
+    }
+    snprintf(dir, sizeof dir, "%s", path);
+    slash = strrchr(dir, '\\');
+    if (slash) *slash = '\0';
+    SHCreateDirectoryExA(NULL, dir, NULL);
+    f = fopen(path, "w");
+    if (f) fclose(f);
+#endif
+}
+
 static void bindings_load(void)
 {
     char path[1024];
@@ -578,6 +655,348 @@ static int launch_game(void)
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 1;
+}
+
+/* --------------------------------------------------------------- install */
+
+/* With no game files found, Play becomes Select ISO: the player points at
+ * an image of their own disc and its files are copied out into a "game"
+ * folder beside this executable, where the game looks first. Read here
+ * rather than with a tool because a player has no tools: XDVDFS is a
+ * tree of fixed-size directory entries (tools/xiso/xdvdfs.py is the same
+ * reader, with the format notes).
+ *
+ * Copied into game.installing and renamed at the end, so a failed install
+ * never leaves a half-filled game folder that looks done. */
+
+#define WM_APP_INSTALLED (WM_APP + 1)
+#define ISO_SECTOR 2048
+
+typedef struct Iso {
+    HANDLE    f;
+    LONGLONG  base;
+    ULONGLONG total, done;
+} Iso;
+
+static HWND g_hwnd;
+static volatile LONG g_install_permille = -1;    /* -1: not installing */
+static char g_install_err[512];
+
+static int iso_read(Iso *iso, ULONGLONG sector, void *buf, DWORD n)
+{
+    LARGE_INTEGER at;
+    DWORD got;
+
+    at.QuadPart = iso->base + (LONGLONG)sector * ISO_SECTOR;
+    return SetFilePointerEx(iso->f, at, NULL, FILE_BEGIN) &&
+           ReadFile(iso->f, buf, n, &got, NULL) && got == n;
+}
+
+/* The game partition sits at one of a few known offsets: 0 for a bare
+ * image (extract-xiso, xdvdfs), further in when the dump kept the DVD-video
+ * partition in front of it (redump: 0x18300000). */
+static int iso_open(Iso *iso, DWORD *root_sector, DWORD *root_size)
+{
+    static const LONGLONG bases[] = { 0x00000000, 0x0000FD90, 0x00030600,
+                                      0x0FD90000, 0x18300000 };
+    unsigned char d[ISO_SECTOR];
+    size_t i;
+
+    for (i = 0; i < sizeof bases / sizeof bases[0]; i++) {
+        iso->base = bases[i];
+        if (iso_read(iso, 32, d, sizeof d) &&
+            memcmp(d, "MICROSOFT*XBOX*MEDIA", 20) == 0) {
+            *root_sector = *(DWORD *)(d + 0x14);
+            *root_size   = *(DWORD *)(d + 0x18);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int iso_copy(Iso *iso, DWORD sector, DWORD size, const char *dest)
+{
+    static unsigned char buf[1 << 20];
+    HANDLE out = CreateFileA(dest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+    ULONGLONG at = sector;
+    int ok = out != INVALID_HANDLE_VALUE;
+
+    while (ok && size) {
+        DWORD n = size < sizeof buf ? size : (DWORD)sizeof buf, put;
+
+        ok = iso_read(iso, at, buf, n) &&
+             WriteFile(out, buf, n, &put, NULL) && put == n;
+        at += n / ISO_SECTOR;           /* every chunk but the last is whole sectors */
+        size -= n;
+        iso->done += n;
+        InterlockedExchange(&g_install_permille,
+                            (LONG)(iso->total ? iso->done * 1000 / iso->total : 0));
+    }
+    if (out != INVALID_HANDLE_VALUE)
+        CloseHandle(out);
+    if (!ok)
+        snprintf(g_install_err, sizeof g_install_err,
+                 "Could not copy %s. Is the disk full, or the image damaged?", dest);
+    return ok;
+}
+
+/* One directory: counts its files' bytes into iso->total, or with dest set
+ * copies them there. The entries are a binary tree but are also packed in
+ * order within each sector, so a walk of the sectors meets all of them
+ * without trusting the tree's links. */
+static int iso_dir(Iso *iso, DWORD sector, DWORD size, const char *dest, int depth)
+{
+    unsigned char *d;
+    DWORD at;
+    int ok = 1;
+
+    if (!size)
+        return 1;
+    if (size > (16u << 20) || depth > 32) {
+        snprintf(g_install_err, sizeof g_install_err, "The image's folders are damaged.");
+        return 0;
+    }
+    d = (unsigned char *)malloc(size);
+    if (!d || !iso_read(iso, sector, d, size)) {
+        free(d);
+        snprintf(g_install_err, sizeof g_install_err, "The image could not be read.");
+        return 0;
+    }
+    for (at = 0; ok && at < size; at += ISO_SECTOR) {
+        DWORD off = 0;
+
+        while (ok && off + 14 <= ISO_SECTOR && at + off + 14 <= size) {
+            const unsigned char *e = d + at + off;
+            WORD  l = (WORD)(e[0] | e[1] << 8), r = (WORD)(e[2] | e[3] << 8);
+            DWORD es = *(const DWORD *)(e + 4), ez = *(const DWORD *)(e + 8);
+            int   attr = e[12], nlen = e[13], j;
+            char  name[256], path[MAX_PATH];
+
+            if ((l == 0xFFFF && r == 0xFFFF) || nlen == 0 ||
+                at + off + 14 + nlen > size)
+                break;
+            /* A name off the disc becomes a path on this one: nothing that
+             * could climb out of the game folder or name a device. */
+            for (j = 0; j < nlen; j++) {
+                char c = (char)e[14 + j];
+
+                if (c < 0x20 || c > 0x7E || strchr("\\/:*?\"<>|", c))
+                    break;
+                name[j] = c;
+            }
+            name[j] = '\0';
+            if (j != nlen || !strcmp(name, ".") || !strcmp(name, "..")) {
+                snprintf(g_install_err, sizeof g_install_err,
+                         "The image holds a file with an unusable name.");
+                ok = 0;
+                break;
+            }
+            if (dest && snprintf(path, sizeof path, "%s\\%s", dest, name) >= (int)sizeof path) {
+                snprintf(g_install_err, sizeof g_install_err,
+                         "This folder's path is too long for the game's files. Move the "
+                         "program to a shorter one, such as C:\\Games\\, and try again.");
+                ok = 0;
+                break;
+            }
+            if (attr & 0x10) {
+                if (dest)
+                    CreateDirectoryA(path, NULL);
+                ok = iso_dir(iso, es, ez, dest ? path : NULL, depth + 1);
+            } else if (dest) {
+                ok = iso_copy(iso, es, ez, path);
+            } else {
+                iso->total += ez;
+            }
+            off += (14 + nlen + 3) & ~3u;
+        }
+    }
+    free(d);
+    return ok;
+}
+
+static void exe_dir(char *out, size_t n)
+{
+    char *slash;
+
+    GetModuleFileNameA(NULL, out, (DWORD)n);
+    slash = strrchr(out, '\\');
+    if (slash) *slash = '\0';
+}
+
+/* Deletes a folder this launcher made (a failed or refused install). */
+static void remove_tree(const char *dir)
+{
+    char from[MAX_PATH + 2];
+    SHFILEOPSTRUCTA op;
+
+    memset(from, 0, sizeof from);                /* the list ends in two NULs */
+    snprintf(from, MAX_PATH, "%s", dir);
+    memset(&op, 0, sizeof op);
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = from;
+    op.fFlags = FOF_NO_UI;
+    SHFileOperationA(&op);
+}
+
+static DWORD WINAPI install_thread(void *arg)
+{
+    char *iso_path = (char *)arg, dir[MAX_PATH], part[MAX_PATH + 32];
+    Iso iso;
+    DWORD root_sector, root_size;
+    ULARGE_INTEGER free_bytes;
+    int ok = 0;
+
+    memset(&iso, 0, sizeof iso);
+    exe_dir(dir, sizeof dir);
+    snprintf(part, sizeof part, "%s\\game.installing", dir);
+
+    iso.f = CreateFileA(iso_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                        FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (iso.f == INVALID_HANDLE_VALUE) {
+        snprintf(g_install_err, sizeof g_install_err, "Could not open %s.", iso_path);
+    } else if (!iso_open(&iso, &root_sector, &root_size)) {
+        snprintf(g_install_err, sizeof g_install_err,
+                 "That file is not an Xbox disc image.");
+    } else if (iso_dir(&iso, root_sector, root_size, NULL, 0)) {
+        if (GetDiskFreeSpaceExA(dir, &free_bytes, NULL, NULL) &&
+            free_bytes.QuadPart < iso.total + (64u << 20)) {
+            snprintf(g_install_err, sizeof g_install_err,
+                     "Not enough space: the game needs %.1f GB beside this program.",
+                     iso.total / 1e9);
+        } else {
+            remove_tree(part);                   /* an earlier attempt's leftovers */
+            CreateDirectoryA(part, NULL);
+            ok = iso_dir(&iso, root_sector, root_size, part, 0);
+            if (ok) {
+                char xbe[MAX_PATH + 48];
+
+                snprintf(xbe, sizeof xbe, "%s\\default.xbe", part);
+                if (GetFileAttributesA(xbe) == INVALID_FILE_ATTRIBUTES) {
+                    snprintf(g_install_err, sizeof g_install_err,
+                             "The image has no default.xbe: it is not a game disc.");
+                    ok = 0;
+                }
+            }
+            if (!ok)
+                remove_tree(part);
+        }
+    }
+    if (iso.f != INVALID_HANDLE_VALUE)
+        CloseHandle(iso.f);
+    free(iso_path);
+    PostMessage(g_hwnd, WM_APP_INSTALLED, (WPARAM)ok, 0);
+    return 0;
+}
+
+static void install_begin(const char *path);
+
+static void install_start(void)
+{
+    char path[MAX_PATH] = "";
+    OPENFILENAMEA ofn;
+
+    if (g_install_permille >= 0)
+        return;
+    memset(&ofn, 0, sizeof ofn);
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner   = g_hwnd;
+    ofn.lpstrFilter = "Xbox disc image (*.iso)\0*.iso\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = sizeof path;
+    ofn.lpstrTitle  = "Select your " LAUNCHER_TITLE " disc image";
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&ofn))
+        return;
+    install_begin(path);
+}
+
+/* Also reached by dropping an image on the launcher's icon: its path is
+ * the command line. */
+static void install_begin(const char *path)
+{
+    HANDLE t;
+
+    g_install_err[0] = '\0';
+    InterlockedExchange(&g_install_permille, 0);
+    t = CreateThread(NULL, 0, install_thread, _strdup(path), 0, NULL);
+    if (t)
+        CloseHandle(t);
+    else
+        InterlockedExchange(&g_install_permille, -1);
+}
+
+#ifdef LAUNCHER_XBE_SHA1
+static int sha1_hex(const char *path, char out[41])
+{
+    static BYTE buf[1 << 16];
+    HCRYPTPROV prov;
+    HCRYPTHASH h;
+    BYTE dig[20];
+    DWORD n, len = sizeof dig;
+    FILE *f;
+    int ok = 0, i;
+
+    if (!CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+        return 0;
+    if (CryptCreateHash(prov, CALG_SHA1, 0, 0, &h)) {
+        f = fopen(path, "rb");
+        if (f) {
+            ok = 1;
+            while (ok && (n = (DWORD)fread(buf, 1, sizeof buf, f)) > 0)
+                ok = CryptHashData(h, buf, n, 0) != 0;
+            fclose(f);
+            ok = ok && CryptGetHashParam(h, HP_HASHVAL, dig, &len, 0);
+            for (i = 0; ok && i < 20; i++)
+                snprintf(out + i * 2, 3, "%02x", dig[i]);
+        }
+        CryptDestroyHash(h);
+    }
+    CryptReleaseContext(prov, 0);
+    return ok;
+}
+#endif
+
+static void reload_title(void);
+
+/* Back on the window's thread: check what was copied, and move it into place. */
+static void install_finished(int ok)
+{
+    char dir[MAX_PATH], part[MAX_PATH + 32], game[MAX_PATH + 32];
+
+    InterlockedExchange(&g_install_permille, -1);
+    if (!ok)
+        return;
+    exe_dir(dir, sizeof dir);
+    snprintf(part, sizeof part, "%s\\game.installing", dir);
+    snprintf(game, sizeof game, "%s\\game", dir);
+#ifdef LAUNCHER_XBE_SHA1
+    {
+        char xbe[MAX_PATH + 48], hex[41] = "";
+
+        snprintf(xbe, sizeof xbe, "%s\\default.xbe", part);
+        if (!sha1_hex(xbe, hex) || _stricmp(hex, LAUNCHER_XBE_SHA1) != 0) {
+            if (MessageBoxA(g_hwnd,
+                    "This disc is not the release this build was made for, so the game "
+                    "will most likely not start. (Only the PAL disc is supported for now.)\n\n"
+                    "Keep it installed anyway?",
+                    "Different version", MB_YESNO | MB_ICONWARNING) != IDYES) {
+                remove_tree(part);
+                snprintf(g_install_err, sizeof g_install_err,
+                         "That disc is a different version. Nothing was installed.");
+                return;
+            }
+        }
+    }
+#endif
+    if (!MoveFileExA(part, game, 0)) {
+        snprintf(g_install_err, sizeof g_install_err,
+                 "A folder called \"game\" is already beside this program. Move it away "
+                 "and select the image again.");
+        remove_tree(part);
+        return;
+    }
+    reload_title();
 }
 
 /* ------------------------------------------------------------------- pad */
@@ -666,7 +1085,6 @@ static double g_tab_t = 1.0;
 static int    g_rows_on_tab;
 static double g_pulse;
 static int    g_pad_seen;
-static HWND   g_hwnd;
 
 static ThemeRect tab_rect(int i)
 {
@@ -730,15 +1148,31 @@ static void set_tab(Tab t)
 
 static void rows_for_tab(void)
 {
-    g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
+    g_rows_on_tab = (g_tab == TAB_VIDEO) ? (g_xbe_found[0] ? g_video_count : 0)
                   : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE : 0;
     if (g_sel >= g_rows_on_tab)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
 }
 
+static void reload_title(void)
+{
+    read_title();
+    settings_load();
+    dev_load();
+    build_rows();
+    rows_for_tab();
+    if (g_hwnd)
+        SetWindowTextA(g_hwnd, g_title_name);
+}
+
 static void do_play(void)
 {
+    if (!g_xbe_found[0]) {
+        install_start();
+        return;
+    }
     settings_save();
+    dev_save();
     bindings_save();
     if (launch_game())
         PostMessage(g_hwnd, WM_CLOSE, 0, 0);
@@ -875,7 +1309,38 @@ static void draw(void)
         theme_tab_underline(a, b, g_tab_t);
     }
 
-    if (g_tab == TAB_VIDEO) {
+    if (g_tab == TAB_VIDEO && !g_xbe_found[0]) {
+        ThemeRect p = row_rect(0);
+        LONG permille = g_install_permille;
+        char line[640];
+
+        p.h = 260;
+        theme_panel(p, 0.25);
+        p.x += 24; p.y += 18; p.w -= 48; p.h = 28;
+        theme_text(p, permille >= 0 ? "Installing..." : "Not installed yet", 15, 700,
+                   THEME_TEXT, THEME_LEFT);
+        p.y += 40; p.h = 90;
+        snprintf(line, sizeof line,
+                 "Press SELECT ISO and choose an image of your own %s disc. Its files are "
+                 "copied into a \"game\" folder beside this program, once. Nothing is "
+                 "downloaded, and the image is not changed.", LAUNCHER_TITLE);
+        theme_text_wrapped(p, line, 12, THEME_TEXT_DIM);
+        p.y += 96; p.h = 14;
+        if (permille >= 0) {
+            ThemeRect bar = p;
+
+            theme_panel(bar, 0.2);
+            bar.w = (int)((long long)bar.w * permille / 1000);
+            if (bar.w > 0)
+                theme_panel(bar, 1.0);
+            p.y += 24; p.h = 24;
+            snprintf(line, sizeof line, "%ld%%", permille / 10);
+            theme_text(p, line, 12, 600, THEME_GREEN, THEME_LEFT);
+        } else if (g_install_err[0]) {
+            p.h = 60;
+            theme_text_wrapped(p, g_install_err, 12, THEME_TEXT);
+        }
+    } else if (g_tab == TAB_VIDEO) {
         for (i = 0; i < g_video_count; i++) {
             Row *row = &g_video_rows[i];
             ThemeRect rr = row_rect(i), lr, vr, ar;
@@ -1083,11 +1548,13 @@ static void draw(void)
     {   /* Play, always on screen, always the obvious thing to press. */
         ThemeRect b;
 
-        b.w = 150; b.h = 42;
+        b.w = PLAY_W; b.h = 42;
         b.x = g_cw - 60 - b.w;
         b.y = g_ch - 74;
         theme_panel(b, 0.85);
-        theme_text(b, "PLAY", 13, 700, THEME_TEXT, THEME_CENTRE);
+        theme_text(b, g_xbe_found[0] ? "PLAY"
+                      : g_install_permille >= 0 ? "INSTALLING" : "SELECT ISO",
+                   13, 700, THEME_TEXT, THEME_CENTRE);
     }
 }
 
@@ -1128,7 +1595,7 @@ static int hit_bind_row(int mx, int my)
 
 static int hit_play(int mx, int my)
 {
-    return mx >= g_cw - 60 - 150 && mx < g_cw - 60 &&
+    return mx >= g_cw - 60 - PLAY_W && mx < g_cw - 60 &&
            my >= g_ch - 74 && my < g_ch - 32;
 }
 
@@ -1252,6 +1719,16 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             theme_begin(g_cw, g_ch);
         InvalidateRect(h, NULL, FALSE);
         return 0;
+    case WM_APP_INSTALLED:
+        install_finished((int)wp);
+        InvalidateRect(h, NULL, FALSE);
+        return 0;
+    case WM_CLOSE:
+        if (g_install_permille >= 0 &&
+            MessageBoxA(h, "The game is still being installed. Stop and quit?",
+                        LAUNCHER_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES)
+            return 0;
+        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1267,7 +1744,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     MSG msg;
     RECT r;
 
-    (void)prev; (void)cmd;
+    (void)prev;
 
     /* Before any window exists: otherwise Windows draws us smaller and
      * scales the result up, which on a look made of soft edges and
@@ -1276,6 +1753,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     read_title();
     settings_load();
+    dev_load();
     bindings_load();
     build_rows();
     rows_for_tab();
@@ -1310,6 +1788,17 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     ShowWindow(g_hwnd, show);
     SetTimer(g_hwnd, 1, 16, NULL);          /* the pad, and the glow */
+
+    if (!g_xbe_found[0] && cmd && *cmd) {
+        char iso[MAX_PATH];
+        size_t n;
+
+        snprintf(iso, sizeof iso, "%s", cmd[0] == '"' ? cmd + 1 : cmd);
+        n = strlen(iso);
+        while (n && (iso[n - 1] == ' ' || iso[n - 1] == '"'))
+            iso[--n] = '\0';
+        install_begin(iso);
+    }
 
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);

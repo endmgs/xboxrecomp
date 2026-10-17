@@ -52,18 +52,33 @@ if(WIN32)
         # and the runtime cannot disagree about what they are writing and
         # reading. xbox_input is the pads (recomp_pad.h: SDL3, or XInput),
         # the same code the game reads them with; the rest is in every Windows.
+        # comdlg32: the Select ISO dialog. shell32: folders made and removed
+        # by the install. advapi32: the SHA-1 of the installed XBE.
         target_link_libraries(${TARGET} PRIVATE
-            xbox_config xbox_input user32 gdi32
+            xbox_config xbox_input user32 gdi32 comdlg32 shell32 advapi32
         )
         # recomp_add_launcher(<target> <exe> NO_WIDESCREEN): a title where
         # widescreen cannot be right hides the Widescreen row, and the
         # launcher writes it off. A 2D fighter is the case: its stage
         # bounds and walls are built for 4:3, so a wider view shows space the
         # fighters cannot reach.
-        cmake_parse_arguments(_launcher "NO_WIDESCREEN" "" "" ${ARGN})
+        #
+        # TITLE "<name>": what the window says before the game is installed.
+        # XBE_SHA1 <hex>: the default.xbe this build was made for; an install
+        # from another disc warns. DEV_FILE <path in the game folder> and
+        # DEV_HELP "<text>": a Developer mode row that makes or removes that
+        # file. Keep double quotes out of TITLE and DEV_HELP.
+        cmake_parse_arguments(_launcher "NO_WIDESCREEN"
+                              "TITLE;XBE_SHA1;DEV_FILE;DEV_HELP" "" ${ARGN})
         if(_launcher_NO_WIDESCREEN)
             target_compile_definitions(${TARGET} PRIVATE LAUNCHER_NO_WIDESCREEN=1)
         endif()
+        foreach(_opt TITLE XBE_SHA1 DEV_FILE DEV_HELP)
+            if(DEFINED _launcher_${_opt})
+                target_compile_definitions(${TARGET} PRIVATE
+                    "LAUNCHER_${_opt}=\"${_launcher_${_opt}}\"")
+            endif()
+        endforeach()
         if(MSVC)
             target_compile_options(${TARGET} PRIVATE
                 /W4 $<$<NOT:$<CONFIG:Debug>>:/O2>)
